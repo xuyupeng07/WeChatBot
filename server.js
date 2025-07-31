@@ -1,15 +1,73 @@
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
+const cluster = require('cluster');
+const os = require('os');
 const WechatCrypto = require('./wechatCrypto');
 const MessageHandler = require('./messageHandler');
 
 const app = express();
 const port = process.env.PORT || 3001;
+const maxConcurrency = parseInt(process.env.MAX_CONCURRENCY) || 100;
+const requestTimeout = parseInt(process.env.REQUEST_TIMEOUT) || 30000;
 
-// 中间件
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+// 全局错误计数器
+let errorCount = 0;
+let lastErrorTime = 0;
+
+// 中间件 - 安全限制
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
+
+// 请求限流中间件
+const requestMap = new Map();
+const cleanupInterval = 60000; // 1分钟清理一次
+
+const rateLimitMiddleware = (req, res, next) => {
+  const clientIP = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  
+  // 清理过期记录
+  if (now - lastErrorTime > cleanupInterval) {
+    requestMap.clear();
+    lastErrorTime = now;
+  }
+  
+  const clientRequests = requestMap.get(clientIP) || 0;
+  if (clientRequests >= maxConcurrency) {
+    return res.status(429).json({ error: '请求过于频繁，请稍后再试' });
+  }
+  
+  requestMap.set(clientIP, clientRequests + 1);
+  
+  // 设置请求超时
+  req.setTimeout(requestTimeout, () => {
+    res.status(408).json({ error: '请求超时' });
+  });
+  
+  next();
+};
+
+app.use(rateLimitMiddleware);
+
+// 配置验证
+function validateConfig() {
+  const requiredEnvVars = ['WECHAT_TOKEN', 'WECHAT_AES_KEY', 'WECHAT_CORP_ID'];
+  const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+  
+  if (missingVars.length > 0) {
+    console.error(`缺少必要的环境变量: ${missingVars.join(', ')}`);
+    process.exit(1);
+  }
+  
+  // 验证AES密钥长度
+  if (process.env.WECHAT_AES_KEY.length !== 43) {
+    console.error('WECHAT_AES_KEY必须是43位字符');
+    process.exit(1);
+  }
+}
+
+validateConfig();
 
 // 初始化加解密和消息处理器
 const wechatCrypto = new WechatCrypto(
@@ -21,9 +79,31 @@ const wechatCrypto = new WechatCrypto(
 const messageHandler = new MessageHandler();
 
 // 健康检查接口
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+  app.get('/health', (req, res) => {
+    const healthStatus = messageHandler.getHealthStatus();
+    res.json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      pid: process.pid,
+      ...healthStatus
+    });
+  });
+
+  // 系统统计接口
+  app.get('/stats', (req, res) => {
+    const stats = messageHandler.getStats();
+    res.json({
+      timestamp: new Date().toISOString(),
+      pid: process.pid,
+      ...stats
+    });
+  });
+
+  // 重置统计接口
+  app.post('/stats/reset', (req, res) => {
+    messageHandler.resetStats();
+    res.json({ success: true, message: '统计信息已重置' });
+  });
 
 // 企业微信回调接口 - GET请求用于验证URL
 app.get('/wechat/callback', (req, res) => {
@@ -122,34 +202,108 @@ app.use((req, res) => {
   res.status(404).json({ error: '接口不存在' });
 });
 
-// 启动服务器
-app.listen(port, () => {
-  console.log(`企业微信智能机器人服务器启动成功`);
-  console.log(`端口: ${port}`);
-  console.log(`回调地址: http://localhost:${port}/wechat/callback`);
-  console.log(`健康检查: http://localhost:${port}/health`);
-  console.log(`测试接口: http://localhost:${port}/test/webhook`);
-});
+// 集群模式启动
+function startServer() {
+  const server = app.listen(port, () => {
+    console.log(`企业微信智能机器人服务器启动成功 (进程 ${process.pid})`);
+    console.log(`端口: ${port}`);
+    console.log(`回调地址: http://localhost:${port}/wechat/callback`);
+    console.log(`健康检查: http://localhost:${port}/health`);
+    console.log(`测试接口: http://localhost:${port}/test/webhook`);
+  });
 
-// 优雅关闭
-process.on('SIGTERM', () => {
-  console.log('收到SIGTERM信号，正在关闭服务器...');
-  process.exit(0);
-});
+  // 设置服务器超时
+  server.timeout = requestTimeout;
+  server.keepAliveTimeout = 5000;
+  server.headersTimeout = 60000;
 
-process.on('SIGINT', () => {
-  console.log('收到SIGINT信号，正在关闭服务器...');
-  process.exit(0);
-});
+  return server;
+}
 
-// 未捕获异常处理
-process.on('uncaughtException', (error) => {
-  console.error(`未捕获异常: ${error.message}`);
-  console.error(error.stack);
-  process.exit(1);
-});
+// 根据配置决定是否使用集群
+const useCluster = process.env.CLUSTER_MODE === 'true';
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error(`未处理的Promise拒绝: ${reason}`);
-  console.error(promise);
-});
+if (useCluster && cluster.isMaster) {
+  const numCPUs = os.cpus().length;
+  console.log(`主进程 ${process.pid} 正在启动 ${numCPUs} 个工作进程...`);
+
+  for (let i = 0; i < numCPUs; i++) {
+    cluster.fork();
+  }
+
+  cluster.on('exit', (worker, code, signal) => {
+    console.error(`工作进程 ${worker.process.pid} 退出，代码: ${code}, 信号: ${signal}`);
+    
+    // 重启工作进程
+    if (errorCount < 10) {
+      console.log('正在重启工作进程...');
+      cluster.fork();
+    } else {
+      console.error('错误次数过多，停止重启工作进程');
+    }
+  });
+
+  // 优雅关闭主进程
+  process.on('SIGTERM', () => {
+    console.log('主进程收到SIGTERM信号，正在关闭...');
+    for (const id in cluster.workers) {
+      cluster.workers[id].kill();
+    }
+    process.exit(0);
+  });
+
+} else {
+  // 启动服务器
+  const server = startServer();
+
+  // 优雅关闭
+  const gracefulShutdown = (signal) => {
+    console.log(`收到${signal}信号，正在优雅关闭服务器...`);
+    
+    server.close(() => {
+      console.log('服务器已关闭');
+      
+      // 清理资源
+      requestMap.clear();
+      
+      // 如果消息处理器有清理方法
+      if (messageHandler.cleanup) {
+        messageHandler.cleanup();
+      }
+      
+      process.exit(0);
+    });
+
+    // 强制关闭超时
+    setTimeout(() => {
+      console.error('强制关闭服务器');
+      process.exit(1);
+    }, 10000);
+  };
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+  // 未捕获异常处理
+  process.on('uncaughtException', (error) => {
+    console.error(`未捕获异常: ${error.message}`);
+    console.error(error.stack);
+    errorCount++;
+    
+    if (errorCount > 5) {
+      console.error('错误次数过多，正在关闭进程');
+      process.exit(1);
+    }
+  });
+
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error(`未处理的Promise拒绝: ${reason}`);
+    console.error(promise);
+    errorCount++;
+    
+    if (errorCount > 5) {
+      console.error('错误次数过多，正在关闭进程');
+      process.exit(1);
+    }
+  });
+}

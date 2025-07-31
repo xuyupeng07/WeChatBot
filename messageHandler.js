@@ -2,33 +2,92 @@ const axios = require('axios');
 
 class MessageHandler {
   constructor() {
-    this.aiApiUrl = process.env.AI_API_URL;
-    this.aiApiKey = process.env.AI_API_KEY;
+    this.aiApiUrl = process.env.FASTGPT_API_URL;
+    this.aiApiKey = process.env.FASTGPT_API_KEY;
     this.webhookUrl = process.env.WECHAT_WEBHOOK_URL;
-    // 流式消息存储
+    
+    // 连接池和缓存管理
+    this.connectionPool = new Map();
+    this.responseCache = new Map();
+    this.activeStreams = new Map();
     this.streamStore = new Map();
     
-    // 启动定期清理过期流式消息的任务
+    // 统计信息
+    this.stats = {
+      totalRequests: 0,
+      failedRequests: 0,
+      cachedResponses: 0,
+      activeConnections: 0
+    };
+    
+    // 配置参数
+    this.config = {
+      maxConnections: parseInt(process.env.MAX_CONNECTIONS) || 50,
+      cacheTimeout: parseInt(process.env.CACHE_TIMEOUT) || 300000, // 5分钟
+      requestTimeout: parseInt(process.env.AI_REQUEST_TIMEOUT) || 60000,
+      retryAttempts: parseInt(process.env.RETRY_ATTEMPTS) || 3,
+      retryDelay: parseInt(process.env.RETRY_DELAY) || 1000
+    };
+    
+    // 启动清理任务
     this.startCleanupTask();
   }
   
-  // 启动清理任务
-  startCleanupTask() {
-    // 每5分钟清理一次过期的流式消息状态
-    setInterval(() => {
-      this.cleanupExpiredStreams();
-    }, 5 * 60 * 1000); // 5分钟
+  // 日志系统
+  log(level, message, data = {}) {
+    const timestamp = new Date().toISOString();
+    const logEntry = {
+      timestamp,
+      level,
+      message,
+      pid: process.pid,
+      ...data
+    };
+    
+    console.log(JSON.stringify(logEntry));
   }
   
-  // 清理过期的流式消息状态
-  cleanupExpiredStreams() {
+  // 定时清理任务（合并版本）
+  startCleanupTask() {
+    // 每1分钟清理一次
+    setInterval(() => {
+      this.cleanup();
+    }, 60000);
+  }
+  
+  // 统一清理方法
+  cleanup() {
     const now = Date.now();
-    const expiredStreams = [];
     
+    // 清理过期缓存
+    for (const [key, entry] of this.responseCache) {
+      if (now - entry.timestamp > this.config.cacheTimeout) {
+        this.responseCache.delete(key);
+        this.log('info', '清理过期缓存', { key });
+      }
+    }
+    
+    // 清理超时连接
+    for (const [key, connection] of this.connectionPool) {
+      if (now - connection.startTime > this.config.requestTimeout) {
+        this.connectionPool.delete(key);
+        this.log('warn', '清理超时连接', { key });
+      }
+    }
+    
+    // 清理异常流
+    for (const [streamId, stream] of this.activeStreams) {
+      if (now - stream.startTime > this.config.requestTimeout) {
+        this.activeStreams.delete(streamId);
+        this.log('warn', '清理超时流', { streamId });
+      }
+    }
+    
+    // 清理过期流式消息状态
+    const expiredStreams = [];
     for (const [streamId, streamState] of this.streamStore.entries()) {
       const elapsedTime = (now - streamState.startTime) / 1000;
-      // 清理超过20分钟的流式消息状态
-      if (elapsedTime > 1200) {
+      if (elapsedTime > 1200) { // 20分钟
         expiredStreams.push(streamId);
       }
     }
@@ -36,6 +95,13 @@ class MessageHandler {
     for (const streamId of expiredStreams) {
       this.streamStore.delete(streamId);
     }
+    
+    this.log('info', '资源清理完成', {
+      cacheSize: this.responseCache.size,
+      connectionPool: this.connectionPool.size,
+      activeStreams: this.activeStreams.size,
+      streamStore: this.streamStore.size
+    });
   }
 
   // 处理接收到的消息
@@ -454,27 +520,55 @@ class MessageHandler {
     }
   }
 
-  // 调用AI API获取回复
+  // 调用AI API获取回复（优化版本）
   async getAIResponse(content, streamCallback = null, userId = null) {
     const startTime = Date.now();
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    this.stats.totalRequests++;
+    
     try {
+      // 验证配置
       if (!this.aiApiUrl || !this.aiApiKey) {
+        this.log('error', 'AI API配置缺失', { requestId });
+        this.stats.failedRequests++;
         return null;
+      }
+
+      // 检查连接池限制
+      if (this.connectionPool.size >= this.config.maxConnections) {
+        this.log('warn', '连接池已满', { 
+          requestId, 
+          poolSize: this.connectionPool.size,
+          maxConnections: this.config.maxConnections 
+        });
+        this.stats.failedRequests++;
+        return '系统繁忙，请稍后再试';
       }
 
       // 检测是否为图片生成请求
       const isImageRequest = this.isImageGenerationRequest(content);
       
       if (isImageRequest) {
-        // 调用图片生成API或返回模拟响应
         return await this.handleImageGeneration(content, startTime);
       }
 
-      // 构建 FastGPT 格式的请求体 - 使用固定chatId保持对话连续性
+      // 检查缓存（仅非流式请求）
+      if (!streamCallback) {
+        const cacheKey = this.generateCacheKey(content, userId);
+        const cached = this.responseCache.get(cacheKey);
+        if (cached && Date.now() - cached.timestamp < this.config.cacheTimeout) {
+          this.stats.cachedResponses++;
+          this.log('info', '使用缓存响应', { requestId, cacheKey });
+          return cached.response;
+        }
+      }
+
+      // 构建 FastGPT 格式的请求体
       const fixedChatId = userId ? `wechat_${userId}` : 'wechat_default';
       const requestData = {
-        chatId: fixedChatId, // 使用用户ID作为固定chatId保持对话连续性
-        stream: streamCallback ? true : false, // 根据是否有回调决定是否开启流式
+        chatId: fixedChatId,
+        stream: streamCallback ? true : false,
         messages: [
           {
             role: 'user',
@@ -491,74 +585,192 @@ class MessageHandler {
       const config = {
         headers: {
           'Authorization': `Bearer ${this.aiApiKey}`,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'User-Agent': 'WeChat-AI-Bot/1.0'
         },
-        timeout: 600000, // 设置10分钟超时，给AI充足的响应时间
-        retry: 0,
-        maxRedirects: 0
+        timeout: this.config.requestTimeout,
+        maxRedirects: 0,
+        validateStatus: (status) => status >= 200 && status < 500
       };
 
-      // 如果是流式请求
+      // 添加到连接池
+      this.connectionPool.set(requestId, {
+        startTime,
+        userId,
+        content: content.substring(0, 100) // 限制日志长度
+      });
+
+      this.log('info', '开始AI请求', { 
+        requestId, 
+        userId, 
+        isStream: !!streamCallback,
+        contentLength: content.length 
+      });
+
+      let response;
+      
       if (streamCallback) {
-        config.responseType = 'stream';
-        
+        response = await this.handleStreamRequest(requestData, config, streamCallback, requestId);
+      } else {
+        response = await this.handleRegularRequest(requestData, config, requestId);
+      }
+
+      // 缓存响应（仅非流式请求）
+      if (!streamCallback && response) {
+        const cacheKey = this.generateCacheKey(content, userId);
+        this.responseCache.set(cacheKey, {
+          response,
+          timestamp: Date.now()
+        });
+      }
+
+      // 记录统计信息
+      const duration = Date.now() - startTime;
+      this.log('info', 'AI请求完成', { 
+        requestId, 
+        duration, 
+        responseLength: response ? response.length : 0 
+      });
+
+      // 从连接池移除
+      this.connectionPool.delete(requestId);
+
+      return response;
+
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      this.log('error', 'AI请求失败', { 
+        requestId, 
+        error: error.message, 
+        duration,
+        stack: error.stack 
+      });
+      
+      this.stats.failedRequests++;
+      this.connectionPool.delete(requestId);
+      
+      // 根据错误类型返回友好提示
+      if (error.code === 'ECONNREFUSED') {
+        return 'AI服务暂时不可用，请稍后再试';
+      } else if (error.code === 'ETIMEDOUT') {
+        return 'AI响应超时，请稍后再试';
+      } else if (error.response?.status >= 400 && error.response?.status < 500) {
+        return '请求参数错误，请检查输入内容';
+      } else {
+        return 'AI服务异常，请稍后再试';
+      }
+    }
+  }
+
+  // 处理非流式请求
+  async handleRegularRequest(requestData, config, requestId) {
+    let lastError;
+    
+    for (let attempt = 1; attempt <= this.config.retryAttempts; attempt++) {
+      try {
         const response = await axios.post(this.aiApiUrl, requestData, config);
         
-        let fullContent = '';
+        if (response.status === 200 && response.data?.choices?.[0]?.message?.content) {
+          return response.data.choices[0].message.content;
+        }
         
-        return new Promise((resolve, reject) => {
-          response.data.on('data', (chunk) => {
-            const lines = chunk.toString().split('\n');
-            
+        lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
+        
+      } catch (error) {
+        lastError = error;
+        
+        if (attempt < this.config.retryAttempts) {
+          this.log('warn', `重试AI请求 (${attempt}/${this.config.retryAttempts})`, {
+            requestId,
+            error: error.message
+          });
+          
+          await new Promise(resolve => setTimeout(resolve, this.config.retryDelay * attempt));
+          continue;
+        }
+      }
+    }
+    
+    throw lastError;
+  }
+
+  // 处理流式请求
+  async handleStreamRequest(requestData, config, streamCallback, requestId) {
+    const streamConfig = { ...config, responseType: 'stream' };
+    
+    try {
+      const response = await axios.post(this.aiApiUrl, requestData, streamConfig);
+      
+      if (response.status !== 200) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      // 记录活跃流
+      this.activeStreams.set(requestId, {
+        startTime: Date.now(),
+        userId: requestData.chatId
+      });
+
+      let fullContent = '';
+      let buffer = '';
+
+      return new Promise((resolve, reject) => {
+        response.data.on('data', (chunk) => {
+          try {
+            buffer += chunk.toString();
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || ''; // 保留不完整的行
+
             for (const line of lines) {
               if (line.startsWith('data: ')) {
                 const data = line.slice(6).trim();
                 
                 if (data === '[DONE]') {
+                  this.activeStreams.delete(requestId);
+                  streamCallback('', true);
                   resolve(fullContent);
                   return;
                 }
                 
                 try {
                   const parsed = JSON.parse(data);
-                  if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) {
-                    const content = parsed.choices[0].delta.content || '';
-                    if (content) {
-                      fullContent += content;
-                      // 调用流式回调
-                      streamCallback(content, false);
-                    }
+                  if (parsed.choices?.[0]?.delta?.content) {
+                    const content = parsed.choices[0].delta.content;
+                    fullContent += content;
+                    streamCallback(content, false);
                   }
                 } catch (e) {
-                  // 忽略解析错误
+                  // 忽略无效的JSON
                 }
               }
             }
-          });
-          
-          response.data.on('end', () => {
-            // 发送完成信号
-            streamCallback('', true);
-            resolve(fullContent);
-          });
-          
-          response.data.on('error', (error) => {
-            reject(error);
-          });
+          } catch (error) {
+            this.log('error', '流式处理错误', { requestId, error: error.message });
+          }
         });
-      } else {
-        // 非流式请求
-        const response = await axios.post(this.aiApiUrl, requestData, config);
-        
-        if (response.data && response.data.choices && response.data.choices[0]) {
-          return response.data.choices[0].message.content;
-        }
-        
-        return null;
-      }
+
+        response.data.on('end', () => {
+          this.activeStreams.delete(requestId);
+          streamCallback('', true);
+          resolve(fullContent);
+        });
+
+        response.data.on('error', (error) => {
+          this.activeStreams.delete(requestId);
+          this.log('error', '流式响应错误', { requestId, error: error.message });
+          reject(error);
+        });
+      });
+
     } catch (error) {
-      return null;
+      this.activeStreams.delete(requestId);
+      throw error;
     }
+  }
+
+  // 生成缓存键
+  generateCacheKey(content, userId) {
+    return `cache_${userId}_${Buffer.from(content).toString('base64').substring(0, 32)}`;
   }
 
   // 检测是否为图片生成请求
@@ -635,6 +847,7 @@ class MessageHandler {
   async sendWebhookMessage(content) {
     try {
       if (!this.webhookUrl) {
+        this.log('warn', 'Webhook URL未配置');
         return false;
       }
 
@@ -646,13 +859,98 @@ class MessageHandler {
       }, {
         headers: {
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: 5000
       });
 
+      this.log('info', 'Webhook消息发送成功', { contentLength: content.length });
       return true;
     } catch (error) {
+      this.log('error', 'Webhook消息发送失败', { error: error.message });
       return false;
     }
+  }
+
+  // 获取系统健康状态
+  getHealthStatus() {
+    const memUsage = process.memoryUsage();
+    const now = Date.now();
+    
+    // 计算活跃连接数
+    let activeConnections = 0;
+    for (const [key, connection] of this.connectionPool) {
+      if (now - connection.startTime < this.config.requestTimeout) {
+        activeConnections++;
+      }
+    }
+    
+    return {
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      pid: process.pid,
+      memory: {
+        rss: Math.round(memUsage.rss / 1024 / 1024) + 'MB',
+        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + 'MB',
+        heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) + 'MB',
+        external: Math.round(memUsage.external / 1024 / 1024) + 'MB'
+      },
+      stats: {
+        ...this.stats,
+        activeConnections,
+        cacheSize: this.responseCache.size,
+        activeStreams: this.activeStreams.size,
+        streamStoreSize: this.streamStore.size
+      },
+      uptime: Math.round(process.uptime()) + 's'
+    };
+  }
+
+  // 获取统计信息
+  getStats() {
+    return {
+      ...this.stats,
+      memoryUsage: process.memoryUsage(),
+      uptime: process.uptime(),
+      connections: {
+        pool: this.connectionPool.size,
+        streams: this.activeStreams.size,
+        cache: this.responseCache.size,
+        streamStore: this.streamStore.size
+      },
+      config: this.config
+    };
+  }
+
+  // 清理所有资源（用于优雅关闭）
+  cleanup() {
+    this.log('info', '开始清理资源');
+    
+    // 清理所有存储
+    this.connectionPool.clear();
+    this.responseCache.clear();
+    this.activeStreams.clear();
+    this.streamStore.clear();
+    
+    // 重置统计
+    this.stats = {
+      totalRequests: 0,
+      failedRequests: 0,
+      cachedResponses: 0,
+      activeConnections: 0
+    };
+    
+    this.log('info', '资源清理完成');
+  }
+
+  // 重置统计信息
+  resetStats() {
+    this.stats = {
+      totalRequests: 0,
+      failedRequests: 0,
+      cachedResponses: 0,
+      activeConnections: 0
+    };
+    this.log('info', '统计信息已重置');
   }
 }
 
