@@ -78,13 +78,15 @@ class MessageHandler {
       startTime: Date.now(),
       originalContent: content,
       messageData: messageData,
-      aiCalling: true // 标记正在调用AI
+      aiCalling: true, // 标记正在调用AI
+      streamContent: '',
+      lastUpdateTime: Date.now()
     });
     
-    // 立即开始调用AI API
-    this.processAIStreamResponse(content, streamId);
+    // 立即开始调用AI API，使用同步流式处理
+    this.processImmediateAIStream(content, streamId);
     
-    // 返回空的初始流式消息，等待AI回复
+    // 返回初始流式消息，内容会在后续步骤中更新
     return this.createStreamResponse('', false, [], streamId);
   }
   
@@ -96,18 +98,48 @@ class MessageHandler {
         return;
       }
       
-      // 调用AI获取回复
-      const aiResponse = await this.getAIResponse(content);
+      // 初始化流式响应状态
+      streamState.aiResponse = '';
+      streamState.streamContent = '';
+      
+      // 定义流式回调函数
+      const streamCallback = (chunk, isComplete) => {
+        const currentStreamState = this.streamStore.get(streamId);
+        if (!currentStreamState) {
+          return;
+        }
+        
+        if (!isComplete && chunk) {
+          // 累积流式内容
+          currentStreamState.streamContent += chunk;
+          currentStreamState.aiResponse = currentStreamState.streamContent;
+          currentStreamState.lastUpdateTime = Date.now();
+        } else if (isComplete) {
+          // 流式响应完成
+          currentStreamState.aiResponseTime = Date.now();
+          currentStreamState.aiCalling = false;
+          currentStreamState.streamComplete = true;
+        }
+      };
+      
+      // 调用AI获取流式回复
+      const aiResponse = await this.getAIResponse(content, streamCallback);
       
       if (aiResponse) {
-        const responseText = aiResponse.text || aiResponse;
-        // 保存AI回复到状态中
-        streamState.aiResponse = responseText;
-        streamState.aiResponseTime = Date.now();
-        streamState.aiCalling = false; // 清除调用标记
+        const currentStreamState = this.streamStore.get(streamId);
+        if (currentStreamState) {
+          // 确保最终响应被保存
+          currentStreamState.aiResponse = aiResponse;
+          currentStreamState.aiResponseTime = Date.now();
+          currentStreamState.aiCalling = false;
+          currentStreamState.streamComplete = true;
+        }
       } else {
-        streamState.aiCalling = false; // 清除调用标记
-        streamState.aiError = '抱歉，我现在无法回答您的问题，请稍后再试。';
+        const currentStreamState = this.streamStore.get(streamId);
+        if (currentStreamState) {
+          currentStreamState.aiCalling = false;
+          currentStreamState.aiError = '抱歉，我现在无法回答您的问题，请稍后再试。';
+        }
       }
     } catch (error) {
       const streamState = this.streamStore.get(streamId);
@@ -115,6 +147,129 @@ class MessageHandler {
         streamState.aiCalling = false; // 清除调用标记
         
         // 根据错误类型给出不同的提示
+        if (error.code === 'ECONNABORTED') {
+          streamState.aiError = '抱歉，AI响应超时，请尝试简化您的问题后重新发送。';
+        } else if (error.response && error.response.status >= 500) {
+          streamState.aiError = '抱歉，AI服务暂时不可用，请稍后再试。';
+        } else {
+          streamState.aiError = '抱歉，处理您的问题时出现错误，请稍后再试。';
+        }
+      }
+    }
+  }
+
+  // 立即处理AI流式响应，实现微信机器人和FastGPT同步响应
+  async processImmediateAIStream(content, streamId) {
+    try {
+      const streamState = this.streamStore.get(streamId);
+      if (!streamState) {
+        return;
+      }
+
+      // 初始化流式响应状态
+      streamState.aiResponse = '';
+      streamState.streamContent = '';
+      streamState.isStreaming = true;
+
+      // 构建 FastGPT 格式的请求体
+      const requestData = {
+        chatId: `chat_${Date.now()}`,
+        stream: true,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: content
+              }
+            ]
+          }
+        ]
+      };
+
+      const config = {
+        headers: {
+          'Authorization': `Bearer ${this.aiApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        responseType: 'stream',
+        timeout: 600000,
+        retry: 0,
+        maxRedirects: 0
+      };
+
+      const response = await axios.post(this.aiApiUrl, requestData, config);
+      
+      let fullContent = '';
+      
+      response.data.on('data', (chunk) => {
+        const lines = chunk.toString().split('\n');
+        
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6).trim();
+            
+            if (data === '[DONE]') {
+              // 流式响应完成
+              if (streamState) {
+                streamState.aiResponse = fullContent;
+                streamState.aiResponseTime = Date.now();
+                streamState.aiCalling = false;
+                streamState.streamComplete = true;
+                streamState.isStreaming = false;
+              }
+              return;
+            }
+            
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) {
+                const content = parsed.choices[0].delta.content || '';
+                if (content) {
+                  fullContent += content;
+                  
+                  // 立即更新流式内容，实现同步响应
+                  const currentStreamState = this.streamStore.get(streamId);
+                  if (currentStreamState) {
+                    currentStreamState.streamContent = fullContent;
+                    currentStreamState.lastUpdateTime = Date.now();
+                  }
+                }
+              }
+            } catch (e) {
+              // 忽略解析错误
+            }
+          }
+        }
+      });
+      
+      response.data.on('end', () => {
+        const currentStreamState = this.streamStore.get(streamId);
+        if (currentStreamState) {
+          currentStreamState.aiResponse = fullContent;
+          currentStreamState.aiResponseTime = Date.now();
+          currentStreamState.aiCalling = false;
+          currentStreamState.streamComplete = true;
+          currentStreamState.isStreaming = false;
+        }
+      });
+      
+      response.data.on('error', (error) => {
+        const currentStreamState = this.streamStore.get(streamId);
+        if (currentStreamState) {
+          currentStreamState.aiCalling = false;
+          currentStreamState.aiError = 'AI服务连接失败';
+          currentStreamState.isStreaming = false;
+        }
+      });
+
+    } catch (error) {
+      const streamState = this.streamStore.get(streamId);
+      if (streamState) {
+        streamState.aiCalling = false;
+        streamState.isStreaming = false;
+        
         if (error.code === 'ECONNABORTED') {
           streamState.aiError = '抱歉，AI响应超时，请尝试简化您的问题后重新发送。';
         } else if (error.response && error.response.status >= 500) {
@@ -198,14 +353,27 @@ class MessageHandler {
       return { content: '抱歉，处理时间过长，请重新发送消息', finished: true };
     }
     
-    // 如果有AI回复，立即返回回复内容并结束流式消息
-    if (streamState.aiResponse) {
-      return { content: streamState.aiResponse, finished: true };
-    }
-    
     // 如果AI调用失败，返回错误信息
     if (streamState.aiError) {
       return { content: streamState.aiError, finished: true };
+    }
+    
+    // 立即返回最新的流式内容，无需等待
+    if (streamState.streamContent !== undefined) {
+      const contentToSend = streamState.streamContent;
+      
+      // 如果流式响应已完成，返回最终内容
+      if (streamState.streamComplete) {
+        return { content: contentToSend, finished: true };
+      }
+      
+      // 立即返回当前累积的内容，实现真正的同步流式响应
+      return { content: contentToSend, finished: false };
+    }
+    
+    // 如果有完整的AI回复（非流式情况），立即返回回复内容并结束流式消息
+    if (streamState.aiResponse && !streamState.streamContent) {
+      return { content: streamState.aiResponse, finished: true };
     }
     
     // 如果正在调用AI API，返回空内容继续等待
@@ -287,7 +455,7 @@ class MessageHandler {
   }
 
   // 调用AI API获取回复
-  async getAIResponse(content) {
+  async getAIResponse(content, streamCallback = null) {
     const startTime = Date.now();
     try {
       if (!this.aiApiUrl || !this.aiApiKey) {
@@ -302,33 +470,91 @@ class MessageHandler {
         return await this.handleImageGeneration(content, startTime);
       }
 
-      const response = await axios.post(this.aiApiUrl, {
-        model: 'gpt-3.5-turbo',
+      // 构建 FastGPT 格式的请求体
+      const requestData = {
+        chatId: `chat_${Date.now()}`, // 生成唯一的 chatId
+        stream: streamCallback ? true : false, // 根据是否有回调决定是否开启流式
         messages: [
           {
             role: 'user',
-            content: content
+            content: [
+              {
+                type: 'text',
+                text: content
+              }
+            ]
           }
-        ],
-        max_tokens: 1000,
-        temperature: 0.7,
-        stream: false
-      }, {
+        ]
+      };
+
+      const config = {
         headers: {
           'Authorization': `Bearer ${this.aiApiKey}`,
           'Content-Type': 'application/json'
         },
         timeout: 600000, // 设置10分钟超时，给AI充足的响应时间
-        // 禁用axios的自动重试，只尝试一次
         retry: 0,
         maxRedirects: 0
-      });
-      
-      if (response.data && response.data.choices && response.data.choices[0]) {
-        return response.data.choices[0].message.content;
+      };
+
+      // 如果是流式请求
+      if (streamCallback) {
+        config.responseType = 'stream';
+        
+        const response = await axios.post(this.aiApiUrl, requestData, config);
+        
+        let fullContent = '';
+        
+        return new Promise((resolve, reject) => {
+          response.data.on('data', (chunk) => {
+            const lines = chunk.toString().split('\n');
+            
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const data = line.slice(6).trim();
+                
+                if (data === '[DONE]') {
+                  resolve(fullContent);
+                  return;
+                }
+                
+                try {
+                  const parsed = JSON.parse(data);
+                  if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) {
+                    const content = parsed.choices[0].delta.content || '';
+                    if (content) {
+                      fullContent += content;
+                      // 调用流式回调
+                      streamCallback(content, false);
+                    }
+                  }
+                } catch (e) {
+                  // 忽略解析错误
+                }
+              }
+            }
+          });
+          
+          response.data.on('end', () => {
+            // 发送完成信号
+            streamCallback('', true);
+            resolve(fullContent);
+          });
+          
+          response.data.on('error', (error) => {
+            reject(error);
+          });
+        });
+      } else {
+        // 非流式请求
+        const response = await axios.post(this.aiApiUrl, requestData, config);
+        
+        if (response.data && response.data.choices && response.data.choices[0]) {
+          return response.data.choices[0].message.content;
+        }
+        
+        return null;
       }
-      
-      return null;
     } catch (error) {
       return null;
     }
