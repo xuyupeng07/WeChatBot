@@ -122,8 +122,8 @@ class MessageHandler {
         }
       };
       
-      // 调用AI获取流式回复
-      const aiResponse = await this.getAIResponse(content, streamCallback);
+      // 调用AI获取流式回复，传入用户ID保持对话连续性
+      const aiResponse = await this.getAIResponse(content, streamCallback, streamState.messageData.from);
       
       if (aiResponse) {
         const currentStreamState = this.streamStore.get(streamId);
@@ -171,9 +171,9 @@ class MessageHandler {
       streamState.streamContent = '';
       streamState.isStreaming = true;
 
-      // 构建 FastGPT 格式的请求体
+      // 构建 FastGPT 格式的请求体 - 使用固定chatId保持对话连续性
       const requestData = {
-        chatId: `chat_${Date.now()}`,
+        chatId: `wechat_${streamState.messageData.from}`, // 使用用户ID作为固定chatId
         stream: true,
         messages: [
           {
@@ -398,7 +398,7 @@ class MessageHandler {
     });
     
     if (textContent.trim()) {
-      const aiResponse = await this.getAIResponse(textContent.trim());
+      const aiResponse = await this.getAIResponse(textContent.trim(), null, messageData.from);
       if (aiResponse) {
         return this.createStreamResponse(aiResponse, true);
       }
@@ -455,7 +455,7 @@ class MessageHandler {
   }
 
   // 调用AI API获取回复
-  async getAIResponse(content, streamCallback = null) {
+  async getAIResponse(content, streamCallback = null, userId = null) {
     const startTime = Date.now();
     try {
       if (!this.aiApiUrl || !this.aiApiKey) {
@@ -470,9 +470,10 @@ class MessageHandler {
         return await this.handleImageGeneration(content, startTime);
       }
 
-      // 构建 FastGPT 格式的请求体
+      // 构建 FastGPT 格式的请求体 - 使用固定chatId保持对话连续性
+      const fixedChatId = userId ? `wechat_${userId}` : 'wechat_default';
       const requestData = {
-        chatId: `chat_${Date.now()}`, // 生成唯一的 chatId
+        chatId: fixedChatId, // 使用用户ID作为固定chatId保持对话连续性
         stream: streamCallback ? true : false, // 根据是否有回调决定是否开启流式
         messages: [
           {

@@ -44,7 +44,7 @@ curl --location --request POST 'http://localhost:3000/api/v1/chat/completions' \
 
 ### 1. 请求格式适配
 
-- **chatId**: 自动生成唯一的对话ID (`chat_${timestamp}`)
+- **chatId**: 使用固定对话ID (`wechat_${userId}`) 保持对话连续性
 - **stream**: 根据是否提供流式回调自动设置
 - **messages**: 按照 FastGPT 规范格式化消息内容
   - 支持 `text` 类型的文本消息

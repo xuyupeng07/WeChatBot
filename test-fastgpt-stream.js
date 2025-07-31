@@ -107,7 +107,7 @@ async function testFastGPTStream() {
   
   try {
     console.log('\n1. 测试非流式请求:');
-    const nonStreamResponse = await handler.getAIResponse('你好');
+    const nonStreamResponse = await handler.getAIResponse('你好', null, 'test_user');
     console.log('非流式响应:', nonStreamResponse);
     
     console.log('\n2. 测试流式请求:');
@@ -121,7 +121,7 @@ async function testFastGPTStream() {
       }
     };
     
-    const streamResponse = await handler.getAIResponse('你好', streamCallback);
+    const streamResponse = await handler.getAIResponse('你好', streamCallback, 'test_user');
     console.log('流式响应返回值:', streamResponse);
     
     console.log('\n3. 测试流式消息处理:');
