@@ -23,6 +23,40 @@ class MessageHandler {
     this.webhookUrl = process.env.WECHAT_WEBHOOK_URL;
     // 流式消息存储
     this.streamStore = new Map();
+    
+    // 启动定期清理过期流式消息的任务
+    this.startCleanupTask();
+  }
+  
+  // 启动清理任务
+  startCleanupTask() {
+    // 每5分钟清理一次过期的流式消息状态
+    setInterval(() => {
+      this.cleanupExpiredStreams();
+    }, 5 * 60 * 1000); // 5分钟
+  }
+  
+  // 清理过期的流式消息状态
+  cleanupExpiredStreams() {
+    const now = Date.now();
+    const expiredStreams = [];
+    
+    for (const [streamId, streamState] of this.streamStore.entries()) {
+      const elapsedTime = (now - streamState.startTime) / 1000;
+      // 清理超过20分钟的流式消息状态
+      if (elapsedTime > 1200) {
+        expiredStreams.push(streamId);
+      }
+    }
+    
+    for (const streamId of expiredStreams) {
+      this.streamStore.delete(streamId);
+      logger.info(`清理过期流式消息状态，StreamID: ${streamId}`);
+    }
+    
+    if (expiredStreams.length > 0) {
+      logger.info(`清理了 ${expiredStreams.length} 个过期的流式消息状态`);
+    }
   }
 
   // 处理接收到的消息
@@ -72,41 +106,66 @@ class MessageHandler {
       content: '',
       startTime: Date.now(),
       originalContent: content,
-      messageData: messageData
+      messageData: messageData,
+      aiCalling: true // 标记正在调用AI
     });
     
     logger.info(`启动流式消息回复，StreamID: ${streamId}`);
     
-    // 返回初始流式消息
-    return this.createStreamResponse('正在思考您的问题...', false, [], streamId);
+    // 立即开始调用AI API
+    this.processAIStreamResponse(content, streamId);
+    
+    // 返回空的初始流式消息，等待AI回复
+    return this.createStreamResponse('', false, [], streamId);
   }
   
-  // 异步处理AI请求
-  async processAIRequestAsync(content, streamId, messageData) {
+  // 异步处理AI流式响应
+  async processAIStreamResponse(content, streamId) {
     try {
-      logger.info(`异步处理AI请求: ${content}, StreamID: ${streamId}`);
+      logger.info(`开始异步AI流式处理: ${content}, StreamID: ${streamId}`);
+      
+      const streamState = this.streamStore.get(streamId);
+      if (!streamState) {
+        logger.warn(`流式状态不存在，StreamID: ${streamId}`);
+        return;
+      }
       
       // 调用AI获取回复
       const aiResponse = await this.getAIResponse(content);
       
       if (aiResponse) {
-        // 检查是否包含图片内容
-        if (aiResponse.images && aiResponse.images.length > 0) {
-          logger.info(`AI返回图片响应，StreamID: ${streamId}`);
-          // 这里应该通过webhook或其他方式发送最终的流式消息
-          // 由于当前架构限制，我们记录日志表示处理完成
-          logger.info(`图片生成完成: ${aiResponse.text || '图片已生成'}, StreamID: ${streamId}`);
-        } else {
-          logger.info(`AI返回文本响应，StreamID: ${streamId}`);
-          // 这里应该通过webhook或其他方式发送最终的流式消息
-          logger.info(`AI响应完成: ${aiResponse.text || aiResponse}, StreamID: ${streamId}`);
-        }
+        const responseText = aiResponse.text || aiResponse;
+        // 保存AI回复到状态中
+        streamState.aiResponse = responseText;
+        streamState.aiResponseTime = Date.now();
+        streamState.aiCalling = false; // 清除调用标记
+        logger.info(`AI响应成功，StreamID: ${streamId}, 响应长度: ${responseText.length}`);
       } else {
-        logger.error(`AI请求失败，StreamID: ${streamId}`);
+        streamState.aiCalling = false; // 清除调用标记
+        streamState.aiError = '抱歉，我现在无法回答您的问题，请稍后再试。';
+        logger.warn(`AI API返回空响应，StreamID: ${streamId}`);
       }
     } catch (error) {
+      const streamState = this.streamStore.get(streamId);
+      if (streamState) {
+        streamState.aiCalling = false; // 清除调用标记
+        
+        // 根据错误类型给出不同的提示
+        if (error.code === 'ECONNABORTED') {
+          streamState.aiError = '抱歉，AI响应超时，请尝试简化您的问题后重新发送。';
+        } else if (error.response && error.response.status >= 500) {
+          streamState.aiError = '抱歉，AI服务暂时不可用，请稍后再试。';
+        } else {
+          streamState.aiError = '抱歉，处理您的问题时出现错误，请稍后再试。';
+        }
+      }
       logger.error(`异步AI请求处理失败，StreamID: ${streamId}, 错误: ${error.message}`);
     }
+  }
+  
+  // 异步处理AI请求（保留原方法以兼容其他调用）
+  async processAIRequestAsync(content, streamId, messageData) {
+    return this.processAIStreamResponse(content, streamId);
   }
   
   // 处理流式消息
@@ -119,11 +178,27 @@ class MessageHandler {
     
     // 获取或创建流式消息状态
     if (!this.streamStore.has(streamId)) {
-      this.streamStore.set(streamId, {
-        step: 0,
-        content: '',
-        startTime: Date.now()
-      });
+      // 如果streamStore中没有该streamId，尝试重新创建状态
+      logger.warn(`流式消息状态丢失，尝试恢复，StreamID: ${streamId}`);
+      
+      // 尝试从streamId中提取原始消息信息
+      const parts = streamId.split('_');
+      if (parts.length >= 3) {
+        // 重新初始化流式消息状态，从步骤1开始
+        this.streamStore.set(streamId, {
+          step: 0,
+          content: '',
+          startTime: Date.now(),
+          originalContent: '继续之前的对话', // 默认内容
+          messageData: messageData,
+          recovered: true // 标记为恢复的会话
+        });
+        logger.info(`流式消息状态已恢复，StreamID: ${streamId}`);
+      } else {
+        // 无法恢复，返回错误信息
+        logger.error(`无法恢复流式消息状态，StreamID: ${streamId}`);
+        return this.createStreamResponse('会话状态已丢失，请重新发送消息', true, [], streamId);
+      }
     }
     
     const streamState = this.streamStore.get(streamId);
@@ -161,29 +236,35 @@ class MessageHandler {
       return { content: '会话已结束', finished: true };
     }
     
-    // 根据步骤返回不同的流式内容
-    switch (step) {
-      case 1:
-        return { content: '正在思考您的问题...', finished: false };
-      case 2:
-        // 在第2步直接调用AI API获取真实回复
-        try {
-          logger.info(`开始调用AI API: ${streamState.originalContent}`);
-          const aiResponse = await this.getAIResponse(streamState.originalContent);
-          
-          if (aiResponse) {
-            const responseText = aiResponse.text || aiResponse;
-            return { content: responseText, finished: true };
-          } else {
-            return { content: '抱歉，我现在无法回答您的问题，请稍后再试。', finished: true };
-          }
-        } catch (error) {
-          logger.error(`AI API调用失败: ${error.message}`);
-          return { content: '抱歉，处理您的问题时出现错误，请稍后再试。', finished: true };
-        }
-      default:
-        return { content: '回答完毕，如有其他问题请随时询问。', finished: true };
+    // 检查是否超过15分钟（900秒），给AI充足的响应时间
+    const currentTime = Date.now();
+    const elapsedTime = (currentTime - streamState.startTime) / 1000;
+    
+    if (elapsedTime > 900) {
+      // 超过15分钟，结束流式消息
+      logger.info(`流式消息超时结束，StreamID: ${streamId}, 耗时: ${elapsedTime}秒`);
+      return { content: '抱歉，处理时间过长，请重新发送消息', finished: true };
     }
+    
+    // 如果有AI回复，立即返回回复内容并结束流式消息
+    if (streamState.aiResponse) {
+      logger.info(`返回AI回复内容，StreamID: ${streamId}`);
+      return { content: streamState.aiResponse, finished: true };
+    }
+    
+    // 如果AI调用失败，返回错误信息
+    if (streamState.aiError) {
+      logger.info(`返回AI错误信息，StreamID: ${streamId}`);
+      return { content: streamState.aiError, finished: true };
+    }
+    
+    // 如果正在调用AI API，返回空内容继续等待
+    if (streamState.aiCalling) {
+      return { content: '', finished: false };
+    }
+    
+    // 默认情况，继续等待
+    return { content: '', finished: false };
   }
 
   // 处理图文混排消息
@@ -299,7 +380,7 @@ class MessageHandler {
           'Authorization': `Bearer ${this.aiApiKey}`,
           'Content-Type': 'application/json'
         },
-        timeout: 0, // 完全取消超时限制，等待AI响应完成
+        timeout: 600000, // 设置10分钟超时，给AI充足的响应时间
         // 禁用axios的自动重试，只尝试一次
         retry: 0,
         maxRedirects: 0
