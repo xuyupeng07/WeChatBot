@@ -1,20 +1,4 @@
 const axios = require('axios');
-const winston = require('winston');
-
-// 配置日志
-const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.printf(({ timestamp, level, message }) => {
-      return `${timestamp} [${level.toUpperCase()}]: ${message}`;
-    })
-  ),
-  transports: [
-    new winston.transports.Console(),
-    new winston.transports.File({ filename: 'bot.log' })
-  ]
-});
 
 class MessageHandler {
   constructor() {
@@ -51,22 +35,13 @@ class MessageHandler {
     
     for (const streamId of expiredStreams) {
       this.streamStore.delete(streamId);
-      logger.info(`清理过期流式消息状态，StreamID: ${streamId}`);
-    }
-    
-    if (expiredStreams.length > 0) {
-      logger.info(`清理了 ${expiredStreams.length} 个过期的流式消息状态`);
     }
   }
 
   // 处理接收到的消息
   async handleMessage(messageData) {
     try {
-      logger.info(`收到消息: ${JSON.stringify(messageData)}`);
-      
       const { msgtype, msgid, aibotid, chatid, chattype, from } = messageData;
-      
-
       
       // 根据消息类型处理
       switch (msgtype) {
@@ -81,11 +56,9 @@ class MessageHandler {
         case 'stream':
           return await this.handleStreamMessage(messageData);
         default:
-          logger.warn(`未知消息类型: ${msgtype}`);
           return this.createTextResponse('抱歉，我暂时无法处理这种类型的消息。');
       }
     } catch (error) {
-      logger.error(`处理消息失败: ${error.message}`);
       return this.createTextResponse('抱歉，处理消息时出现错误，请稍后再试。');
     }
   }
@@ -94,8 +67,6 @@ class MessageHandler {
   async handleTextMessage(messageData) {
     const { text, from, chattype, msgid } = messageData;
     const content = text.content;
-    
-    logger.info(`处理文本消息: ${content}`);
     
     // 生成流式消息ID
     const streamId = `stream_${msgid}_${Date.now()}`;
@@ -110,8 +81,6 @@ class MessageHandler {
       aiCalling: true // 标记正在调用AI
     });
     
-    logger.info(`启动流式消息回复，StreamID: ${streamId}`);
-    
     // 立即开始调用AI API
     this.processAIStreamResponse(content, streamId);
     
@@ -122,11 +91,8 @@ class MessageHandler {
   // 异步处理AI流式响应
   async processAIStreamResponse(content, streamId) {
     try {
-      logger.info(`开始异步AI流式处理: ${content}, StreamID: ${streamId}`);
-      
       const streamState = this.streamStore.get(streamId);
       if (!streamState) {
-        logger.warn(`流式状态不存在，StreamID: ${streamId}`);
         return;
       }
       
@@ -139,11 +105,9 @@ class MessageHandler {
         streamState.aiResponse = responseText;
         streamState.aiResponseTime = Date.now();
         streamState.aiCalling = false; // 清除调用标记
-        logger.info(`AI响应成功，StreamID: ${streamId}, 响应长度: ${responseText.length}`);
       } else {
         streamState.aiCalling = false; // 清除调用标记
         streamState.aiError = '抱歉，我现在无法回答您的问题，请稍后再试。';
-        logger.warn(`AI API返回空响应，StreamID: ${streamId}`);
       }
     } catch (error) {
       const streamState = this.streamStore.get(streamId);
@@ -159,7 +123,6 @@ class MessageHandler {
           streamState.aiError = '抱歉，处理您的问题时出现错误，请稍后再试。';
         }
       }
-      logger.error(`异步AI请求处理失败，StreamID: ${streamId}, 错误: ${error.message}`);
     }
   }
   
@@ -172,15 +135,11 @@ class MessageHandler {
   async handleStreamMessage(messageData) {
     const { stream, from, chattype } = messageData;
     
-    logger.info(`处理流式消息: StreamID: ${stream.id}`);
-    
     const streamId = stream.id;
     
     // 获取或创建流式消息状态
     if (!this.streamStore.has(streamId)) {
       // 如果streamStore中没有该streamId，尝试重新创建状态
-      logger.warn(`流式消息状态丢失，尝试恢复，StreamID: ${streamId}`);
-      
       // 尝试从streamId中提取原始消息信息
       const parts = streamId.split('_');
       if (parts.length >= 3) {
@@ -193,10 +152,8 @@ class MessageHandler {
           messageData: messageData,
           recovered: true // 标记为恢复的会话
         });
-        logger.info(`流式消息状态已恢复，StreamID: ${streamId}`);
       } else {
         // 无法恢复，返回错误信息
-        logger.error(`无法恢复流式消息状态，StreamID: ${streamId}`);
         return this.createStreamResponse('会话状态已丢失，请重新发送消息', true, [], streamId);
       }
     }
@@ -208,12 +165,9 @@ class MessageHandler {
     const { content, finished } = await this.generateStreamContent(streamId, streamState.step);
     streamState.content = content;
     
-    logger.info(`流式消息步骤 ${streamState.step}: ${content}`);
-    
     // 如果完成，清理状态
     if (finished) {
       this.streamStore.delete(streamId);
-      logger.info(`流式消息完成，StreamID: ${streamId}`);
     }
     
     // 返回流式响应，使用原始的streamId
@@ -223,7 +177,6 @@ class MessageHandler {
   // 处理图片消息
   async handleImageMessage(messageData) {
     const { image } = messageData;
-    logger.info(`收到图片消息: ${image.url}`);
     
     // 这里可以添加图片识别逻辑
     return this.createTextResponse('我看到了您发送的图片，但目前还无法识别图片内容。');
@@ -242,19 +195,16 @@ class MessageHandler {
     
     if (elapsedTime > 900) {
       // 超过15分钟，结束流式消息
-      logger.info(`流式消息超时结束，StreamID: ${streamId}, 耗时: ${elapsedTime}秒`);
       return { content: '抱歉，处理时间过长，请重新发送消息', finished: true };
     }
     
     // 如果有AI回复，立即返回回复内容并结束流式消息
     if (streamState.aiResponse) {
-      logger.info(`返回AI回复内容，StreamID: ${streamId}`);
       return { content: streamState.aiResponse, finished: true };
     }
     
     // 如果AI调用失败，返回错误信息
     if (streamState.aiError) {
-      logger.info(`返回AI错误信息，StreamID: ${streamId}`);
       return { content: streamState.aiError, finished: true };
     }
     
@@ -270,7 +220,6 @@ class MessageHandler {
   // 处理图文混排消息
   async handleMixedMessage(messageData) {
     const { mixed } = messageData;
-    logger.info(`收到图文混排消息，包含 ${mixed.msg_item.length} 个项目`);
     
     // 提取文本内容
     let textContent = '';
@@ -295,23 +244,18 @@ class MessageHandler {
     const { event } = messageData;
     const eventType = event.eventtype;
     
-    logger.info(`处理事件: ${eventType}`);
-    
     switch (eventType) {
       case 'enter_chat':
         return this.handleEnterChatEvent(messageData);
       case 'template_card_event':
         return this.handleTemplateCardEvent(messageData);
       default:
-        logger.warn(`未知事件类型: ${eventType}`);
         return null;
     }
   }
 
   // 处理进入会话事件
   async handleEnterChatEvent(messageData) {
-    logger.info('用户首次进入会话');
-    
     return this.createTemplateCardResponse({
       card_type: 'text_notice',
       main_title: {
@@ -333,8 +277,6 @@ class MessageHandler {
     const { event } = messageData;
     const cardEvent = event.template_card_event;
     
-    logger.info(`模板卡片事件: ${cardEvent.event_key}`);
-    
     // 根据不同的按钮点击处理
     switch (cardEvent.event_key) {
       case 'submit_key':
@@ -348,10 +290,7 @@ class MessageHandler {
   async getAIResponse(content) {
     const startTime = Date.now();
     try {
-      logger.info(`开始调用AI API: ${content}`);
-      
       if (!this.aiApiUrl || !this.aiApiKey) {
-        logger.warn('AI API配置不完整');
         return null;
       }
 
@@ -359,7 +298,6 @@ class MessageHandler {
       const isImageRequest = this.isImageGenerationRequest(content);
       
       if (isImageRequest) {
-        logger.info('检测到图片生成请求');
         // 调用图片生成API或返回模拟响应
         return await this.handleImageGeneration(content, startTime);
       }
@@ -386,26 +324,12 @@ class MessageHandler {
         maxRedirects: 0
       });
       
-      const duration = Date.now() - startTime;
-      logger.info(`AI API调用成功，耗时: ${duration}ms`);
-
       if (response.data && response.data.choices && response.data.choices[0]) {
         return response.data.choices[0].message.content;
       }
       
-      logger.warn('AI API返回格式异常');
       return null;
     } catch (error) {
-      const duration = Date.now() - startTime;
-      if (error.code === 'ECONNABORTED') {
-        logger.error(`AI API调用超时，耗时: ${duration}ms, 错误: ${error.message}`);
-      } else if (error.response) {
-        logger.error(`AI API返回错误，耗时: ${duration}ms, 状态: ${error.response.status} - ${error.response.statusText}`);
-      } else if (error.request) {
-        logger.error(`AI API网络错误，耗时: ${duration}ms, 错误: ${error.message}`);
-      } else {
-        logger.error(`调用AI API失败，耗时: ${duration}ms, 错误: ${error.message}`);
-      }
       return null;
     }
   }
@@ -423,9 +347,6 @@ class MessageHandler {
       // 这里可以调用实际的图片生成API，比如DALL-E、Midjourney等
       // 目前返回一个模拟的响应，说明图片生成功能
       
-      const duration = Date.now() - startTime;
-      logger.info(`图片生成请求处理完成，耗时: ${duration}ms`);
-      
       // 返回包含说明文本的响应，不包含实际图片
       return {
         text: `我理解您想要生成图片："${content}"。\n\n由于当前配置限制，我无法直接生成图片，但我可以：\n1. 为您详细描述这个图片的内容\n2. 提供绘画的步骤和技巧\n3. 推荐相关的图片生成工具\n\n请告诉我您希望我如何帮助您！`,
@@ -433,8 +354,6 @@ class MessageHandler {
       };
       
     } catch (error) {
-      const duration = Date.now() - startTime;
-      logger.error(`图片生成失败，耗时: ${duration}ms, 错误: ${error.message}`);
       return {
         text: '抱歉，图片生成功能暂时不可用，请稍后再试。',
         images: []
@@ -489,7 +408,6 @@ class MessageHandler {
   async sendWebhookMessage(content) {
     try {
       if (!this.webhookUrl) {
-        logger.warn('Webhook URL未配置');
         return false;
       }
 
@@ -504,10 +422,8 @@ class MessageHandler {
         }
       });
 
-      logger.info(`Webhook消息发送成功: ${JSON.stringify(response.data)}`);
       return true;
     } catch (error) {
-      logger.error(`发送Webhook消息失败: ${error.message}`);
       return false;
     }
   }

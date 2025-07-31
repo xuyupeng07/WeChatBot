@@ -1,24 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
-const winston = require('winston');
 const WechatCrypto = require('./wechatCrypto');
 const MessageHandler = require('./messageHandler');
-
-// 配置日志
-const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.printf(({ timestamp, level, message }) => {
-      return `${timestamp} [${level.toUpperCase()}]: ${message}`;
-    })
-  ),
-  transports: [
-    new winston.transports.Console(),
-    new winston.transports.File({ filename: 'server.log' })
-  ]
-});
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -46,11 +30,7 @@ app.get('/wechat/callback', (req, res) => {
   try {
     const { msg_signature, timestamp, nonce, echostr } = req.query;
     
-    logger.info('收到URL验证请求');
-    logger.debug(`参数: signature=${msg_signature}, timestamp=${timestamp}, nonce=${nonce}`);
-    
     if (!msg_signature || !timestamp || !nonce || !echostr) {
-      logger.error('缺少必要参数');
       return res.status(400).send('缺少必要参数');
     }
     
@@ -58,14 +38,11 @@ app.get('/wechat/callback', (req, res) => {
     const decryptedEchostr = wechatCrypto.verifyUrl(msg_signature, timestamp, nonce, echostr);
     
     if (decryptedEchostr) {
-      logger.info('URL验证成功');
       res.send(decryptedEchostr);
     } else {
-      logger.error('URL验证失败');
       res.status(403).send('验证失败');
     }
   } catch (error) {
-    logger.error(`URL验证异常: ${error.message}`);
     res.status(500).send('验证异常');
   }
 });
@@ -75,13 +52,8 @@ app.post('/wechat/callback', async (req, res) => {
   try {
     const { msg_signature, timestamp, nonce } = req.query;
     const { encrypt } = req.body;
-    const requestId = `${timestamp}-${nonce}-${Date.now()}`;
-    
-    logger.info(`收到消息回调 [请求ID: ${requestId}]`);
-    logger.debug(`加密消息: ${encrypt}`);
     
     if (!encrypt) {
-      logger.error('消息体为空');
       return res.status(400).json({ error: '消息体为空' });
     }
     
@@ -89,15 +61,10 @@ app.post('/wechat/callback', async (req, res) => {
     const decryptedData = wechatCrypto.decrypt(encrypt);
     const messageData = JSON.parse(decryptedData.message);
     
-    logger.info(`解密成功，消息类型: ${messageData.msgtype}`);
-    
     // 处理消息
-    logger.info(`开始处理消息 [请求ID: ${requestId}] [消息ID: ${messageData.msgid || 'N/A'}] [消息类型: ${messageData.msgtype}]`);
-    
     let response;
     if (messageData.msgtype === 'stream') {
       // 处理流式消息刷新
-      logger.info(`处理流式消息刷新 [请求ID: ${requestId}]`);
       response = await messageHandler.handleStreamMessage(messageData);
     } else {
       // 处理普通消息
@@ -112,16 +79,12 @@ app.post('/wechat/callback', async (req, res) => {
         nonce
       );
       
-      logger.info(`发送回复消息 [请求ID: ${requestId}]`);
       res.json(encryptedResponse);
     } else {
       // 空回复
-      logger.info(`发送空回复 [请求ID: ${requestId}]`);
       res.json({});
     }
   } catch (error) {
-    logger.error(`处理回调失败: ${error.message}`);
-    logger.error(error.stack);
     res.status(500).json({ error: '处理失败' });
   }
 });
@@ -145,15 +108,12 @@ app.post('/test/webhook', async (req, res) => {
       res.status(500).json({ success: false, message: '消息发送失败' });
     }
   } catch (error) {
-    logger.error(`测试接口错误: ${error.message}`);
     res.status(500).json({ error: '服务器错误' });
   }
 });
 
 // 错误处理中间件
 app.use((error, req, res, next) => {
-  logger.error(`未处理的错误: ${error.message}`);
-  logger.error(error.stack);
   res.status(500).json({ error: '服务器内部错误' });
 });
 
@@ -164,32 +124,32 @@ app.use((req, res) => {
 
 // 启动服务器
 app.listen(port, () => {
-  logger.info(`企业微信智能机器人服务器启动成功`);
-  logger.info(`端口: ${port}`);
-  logger.info(`回调地址: http://localhost:${port}/wechat/callback`);
-  logger.info(`健康检查: http://localhost:${port}/health`);
-  logger.info(`测试接口: http://localhost:${port}/test/webhook`);
+  console.log(`企业微信智能机器人服务器启动成功`);
+  console.log(`端口: ${port}`);
+  console.log(`回调地址: http://localhost:${port}/wechat/callback`);
+  console.log(`健康检查: http://localhost:${port}/health`);
+  console.log(`测试接口: http://localhost:${port}/test/webhook`);
 });
 
 // 优雅关闭
 process.on('SIGTERM', () => {
-  logger.info('收到SIGTERM信号，正在关闭服务器...');
+  console.log('收到SIGTERM信号，正在关闭服务器...');
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  logger.info('收到SIGINT信号，正在关闭服务器...');
+  console.log('收到SIGINT信号，正在关闭服务器...');
   process.exit(0);
 });
 
 // 未捕获异常处理
 process.on('uncaughtException', (error) => {
-  logger.error(`未捕获异常: ${error.message}`);
-  logger.error(error.stack);
+  console.error(`未捕获异常: ${error.message}`);
+  console.error(error.stack);
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error(`未处理的Promise拒绝: ${reason}`);
-  logger.error(promise);
+  console.error(`未处理的Promise拒绝: ${reason}`);
+  console.error(promise);
 });
