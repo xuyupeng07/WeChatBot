@@ -212,9 +212,9 @@ class MessageHandler {
         
         // 根据聊天类型构建不同的chatId，确保同一用户在不同聊天类型中有独立的对话上下文
         if (chatType === 'group') {
-          // 群聊：使用群ID和用户ID的组合，确保同一群内不同用户有独立对话
+          // 群聊：只使用群ID，同一群聊中的所有用户共享同一个对话上下文
           const groupId = streamState.messageData.chatid || 'unknown_group';
-          chatId = `wechat_group_${groupId}_${userId}`;
+          chatId = `wechat_group_${groupId}`;
         } else {
           // 单聊：直接使用用户ID
           chatId = `wechat_single_${userId}`;
@@ -292,9 +292,9 @@ class MessageHandler {
       // 根据聊天类型构建不同的chatId，确保同一用户在不同聊天类型中有独立的对话上下文
       let chatId;
       if (chatType === 'group') {
-        // 群聊：使用群ID和用户ID的组合，确保同一群内不同用户有独立对话
+        // 群聊：只使用群ID，同一群聊中的所有用户共享同一个对话上下文
         const groupId = streamState.messageData.chatid || 'unknown_group';
-        chatId = `wechat_group_${groupId}_${userId}`;
+        chatId = `wechat_group_${groupId}`;
       } else {
         // 单聊：直接使用用户ID
         chatId = `wechat_single_${userId}`;
@@ -437,9 +437,9 @@ class MessageHandler {
     // 根据聊天类型构建不同的chatId，确保同一用户在不同聊天类型中有独立的对话上下文
     let chatId;
     if (chatType === 'group') {
-      // 群聊：使用群ID和用户ID的组合，确保同一群内不同用户有独立对话
+      // 群聊：只使用群ID，同一群聊中的所有用户共享同一个对话上下文
       const groupId = streamState.messageData.chatid || 'unknown_group';
-      chatId = `wechat_group_${groupId}_${userId}`;
+      chatId = `wechat_group_${groupId}`;
     } else {
       // 单聊：直接使用用户ID
       chatId = `wechat_single_${userId}`;
@@ -573,9 +573,9 @@ class MessageHandler {
       // 根据聊天类型构建不同的chatId，确保同一用户在不同聊天类型中有独立的对话上下文
       let chatId;
       if (chatType === 'group') {
-        // 群聊：使用群ID和用户ID的组合，确保同一群内不同用户有独立对话
+        // 群聊：只使用群ID，同一群聊中的所有用户共享同一个对话上下文
         const groupId = messageData.chatid || 'unknown_group';
-        chatId = `wechat_group_${groupId}_${userId}`;
+        chatId = `wechat_group_${groupId}`;
       } else {
         // 单聊：直接使用用户ID
         chatId = `wechat_single_${userId}`;

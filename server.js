@@ -156,7 +156,7 @@ app.post('/wechat/callback', async (req, res) => {
       const chatType = messageData.chattype || 'single';
       if (chatType === 'group') {
         const groupId = messageData.chatid || 'unknown_group';
-        chatId = `wechat_group_${groupId}_${userId}`;
+        chatId = `wechat_group_${groupId}`;
       } else {
         chatId = `wechat_single_${userId}`;
       }
