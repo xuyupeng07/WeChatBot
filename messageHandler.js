@@ -58,12 +58,14 @@ class MessageHandler {
   // 统一清理方法
   cleanup() {
     const now = Date.now();
+    let cleanedItems = 0;
     
     // 清理过期缓存
     for (const [key, entry] of this.responseCache) {
       if (now - entry.timestamp > this.config.cacheTimeout) {
         this.responseCache.delete(key);
-        this.log('info', '清理过期缓存', { key });
+        this.log('debug', '清理过期缓存', { key });
+        cleanedItems++;
       }
     }
     
@@ -72,6 +74,7 @@ class MessageHandler {
       if (now - connection.startTime > this.config.requestTimeout) {
         this.connectionPool.delete(key);
         this.log('warn', '清理超时连接', { key });
+        cleanedItems++;
       }
     }
     
@@ -80,6 +83,7 @@ class MessageHandler {
       if (now - stream.startTime > this.config.requestTimeout) {
         this.activeStreams.delete(streamId);
         this.log('warn', '清理超时流', { streamId });
+        cleanedItems++;
       }
     }
     
@@ -94,14 +98,19 @@ class MessageHandler {
     
     for (const streamId of expiredStreams) {
       this.streamStore.delete(streamId);
+      cleanedItems++;
     }
     
-    this.log('info', '资源清理完成', {
-      cacheSize: this.responseCache.size,
-      connectionPool: this.connectionPool.size,
-      activeStreams: this.activeStreams.size,
-      streamStore: this.streamStore.size
-    });
+    // 只在有实际清理操作时才输出日志
+    if (cleanedItems > 0) {
+      this.log('debug', '资源清理完成', {
+        cleanedItems,
+        cacheSize: this.responseCache.size,
+        connectionPool: this.connectionPool.size,
+        activeStreams: this.activeStreams.size,
+        streamStore: this.streamStore.size
+      });
+    }
   }
 
   // 处理接收到的消息
@@ -157,7 +166,7 @@ class MessageHandler {
   }
   
   // 异步处理AI流式响应
-  async processAIStreamResponse(content, streamId) {
+  async processAIStreamResponse(content, streamId, chatId = null) {
     try {
       const streamState = this.streamStore.get(streamId);
       if (!streamState) {
@@ -188,8 +197,31 @@ class MessageHandler {
         }
       };
       
-      // 调用AI获取流式回复，传入用户ID保持对话连续性
-      const aiResponse = await this.getAIResponse(content, streamCallback, streamState.messageData.from);
+      // 如果没有传入chatId，则从messageData中构建
+      if (!chatId) {
+        // 调用AI获取流式回复，传入用户ID保持对话连续性
+        // 处理 from 字段，确保它是字符串
+        let userId = streamState.messageData.from;
+        if (typeof userId === 'object' && userId !== null) {
+          // 直接从对象中提取userid
+          userId = userId.userid;
+        }
+        
+        // 获取聊天类型，区分单聊和群聊
+        const chatType = streamState.messageData.chattype || 'single';
+        
+        // 根据聊天类型构建不同的chatId，确保同一用户在不同聊天类型中有独立的对话上下文
+        if (chatType === 'group') {
+          // 群聊：使用群ID和用户ID的组合，确保同一群内不同用户有独立对话
+          const groupId = streamState.messageData.chatid || 'unknown_group';
+          chatId = `wechat_group_${groupId}_${userId}`;
+        } else {
+          // 单聊：直接使用用户ID
+          chatId = `wechat_single_${userId}`;
+        }
+      }
+      
+      const aiResponse = await this.getAIResponse(content, streamCallback, chatId);
       
       if (aiResponse) {
         const currentStreamState = this.streamStore.get(streamId);
@@ -199,6 +231,13 @@ class MessageHandler {
           currentStreamState.aiResponseTime = Date.now();
           currentStreamState.aiCalling = false;
           currentStreamState.streamComplete = true;
+          
+          // 打印最终回复的答案
+          if (aiResponse && aiResponse.trim()) {
+            console.log(`[AI回复]`);
+            console.log(aiResponse);
+            console.log('===================================');
+          }
         }
       } else {
         const currentStreamState = this.streamStore.get(streamId);
@@ -238,8 +277,31 @@ class MessageHandler {
       streamState.isStreaming = true;
 
       // 构建 FastGPT 格式的请求体 - 使用固定chatId保持对话连续性
+      // 确保 from 字段是字符串，如果是对象则提取其中的用户ID
+      let userId = '';
+      if (typeof streamState.messageData.from === 'string') {
+        userId = streamState.messageData.from;
+      } else if (typeof streamState.messageData.from === 'object' && streamState.messageData.from !== null) {
+        // 直接从对象中提取userid
+        userId = streamState.messageData.from.userid;
+      }
+      
+      // 获取聊天类型，区分单聊和群聊
+      const chatType = streamState.messageData.chattype || 'single';
+      
+      // 根据聊天类型构建不同的chatId，确保同一用户在不同聊天类型中有独立的对话上下文
+      let chatId;
+      if (chatType === 'group') {
+        // 群聊：使用群ID和用户ID的组合，确保同一群内不同用户有独立对话
+        const groupId = streamState.messageData.chatid || 'unknown_group';
+        chatId = `wechat_group_${groupId}_${userId}`;
+      } else {
+        // 单聊：直接使用用户ID
+        chatId = `wechat_single_${userId}`;
+      }
+      
       const requestData = {
-        chatId: `wechat_${streamState.messageData.from}`, // 使用用户ID作为固定chatId
+        chatId: chatId, // 使用根据聊天类型构建的chatId
         stream: true,
         messages: [
           {
@@ -318,6 +380,13 @@ class MessageHandler {
           currentStreamState.aiCalling = false;
           currentStreamState.streamComplete = true;
           currentStreamState.isStreaming = false;
+          
+          // 打印最终回复的答案
+          if (fullContent && fullContent.trim()) {
+            console.log(`[AI回复]`);
+            console.log(fullContent);
+            console.log('===================================');
+          }
         }
       });
       
@@ -349,7 +418,34 @@ class MessageHandler {
   
   // 异步处理AI请求（保留原方法以兼容其他调用）
   async processAIRequestAsync(content, streamId, messageData) {
-    return this.processAIStreamResponse(content, streamId);
+    // 获取流式状态
+    const streamState = this.streamStore.get(streamId);
+    if (!streamState) {
+      return;
+    }
+
+    // 处理 from 字段，确保它是字符串
+    let userId = streamState.messageData.from;
+    if (typeof userId === 'object' && userId !== null) {
+      // 直接从对象中提取userid
+      userId = streamState.messageData.from.userid;
+    }
+    
+    // 获取聊天类型，区分单聊和群聊
+    const chatType = streamState.messageData.chattype || 'single';
+    
+    // 根据聊天类型构建不同的chatId，确保同一用户在不同聊天类型中有独立的对话上下文
+    let chatId;
+    if (chatType === 'group') {
+      // 群聊：使用群ID和用户ID的组合，确保同一群内不同用户有独立对话
+      const groupId = streamState.messageData.chatid || 'unknown_group';
+      chatId = `wechat_group_${groupId}_${userId}`;
+    } else {
+      // 单聊：直接使用用户ID
+      chatId = `wechat_single_${userId}`;
+    }
+    
+    return this.processAIStreamResponse(content, streamId, chatId);
   }
   
   // 处理流式消息
@@ -464,7 +560,28 @@ class MessageHandler {
     });
     
     if (textContent.trim()) {
-      const aiResponse = await this.getAIResponse(textContent.trim(), null, messageData.from);
+      // 处理 from 字段，确保它是字符串
+      let userId = messageData.from;
+      if (typeof userId === 'object' && userId !== null) {
+        // 直接从对象中提取userid
+        userId = userId.userid;
+      }
+      
+      // 获取聊天类型，区分单聊和群聊
+      const chatType = messageData.chattype || 'single';
+      
+      // 根据聊天类型构建不同的chatId，确保同一用户在不同聊天类型中有独立的对话上下文
+      let chatId;
+      if (chatType === 'group') {
+        // 群聊：使用群ID和用户ID的组合，确保同一群内不同用户有独立对话
+        const groupId = messageData.chatid || 'unknown_group';
+        chatId = `wechat_group_${groupId}_${userId}`;
+      } else {
+        // 单聊：直接使用用户ID
+        chatId = `wechat_single_${userId}`;
+      }
+    
+      const aiResponse = await this.getAIResponse(textContent.trim(), null, chatId);
       if (aiResponse) {
         return this.createStreamResponse(aiResponse, true);
       }
@@ -521,7 +638,7 @@ class MessageHandler {
   }
 
   // 调用AI API获取回复（优化版本）
-  async getAIResponse(content, streamCallback = null, userId = null) {
+  async getAIResponse(content, streamCallback = null, chatId = null) {
     const startTime = Date.now();
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
@@ -555,7 +672,7 @@ class MessageHandler {
 
       // 检查缓存（仅非流式请求）
       if (!streamCallback) {
-        const cacheKey = this.generateCacheKey(content, userId);
+        const cacheKey = this.generateCacheKey(content, chatId);
         const cached = this.responseCache.get(cacheKey);
         if (cached && Date.now() - cached.timestamp < this.config.cacheTimeout) {
           this.stats.cachedResponses++;
@@ -565,7 +682,7 @@ class MessageHandler {
       }
 
       // 构建 FastGPT 格式的请求体
-      const fixedChatId = userId ? `wechat_${userId}` : 'wechat_default';
+      const fixedChatId = chatId || 'wechat_default';
       const requestData = {
         chatId: fixedChatId,
         stream: streamCallback ? true : false,
@@ -769,8 +886,8 @@ class MessageHandler {
   }
 
   // 生成缓存键
-  generateCacheKey(content, userId) {
-    return `cache_${userId}_${Buffer.from(content).toString('base64').substring(0, 32)}`;
+  generateCacheKey(content, chatId) {
+    return `cache_${chatId}_${Buffer.from(content).toString('base64').substring(0, 32)}`;
   }
 
   // 检测是否为图片生成请求
@@ -922,7 +1039,7 @@ class MessageHandler {
   }
 
   // 清理所有资源（用于优雅关闭）
-  cleanup() {
+  shutdown() {
     this.log('info', '开始清理资源');
     
     // 清理所有存储

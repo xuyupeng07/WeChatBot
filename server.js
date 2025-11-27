@@ -141,6 +141,32 @@ app.post('/wechat/callback', async (req, res) => {
     const decryptedData = wechatCrypto.decrypt(encrypt);
     const messageData = JSON.parse(decryptedData.message);
     
+    // 只打印用户的问题和当前对话的chatid
+    if (messageData.msgtype === 'text' && messageData.text && messageData.text.content) {
+      // 获取用户ID
+      let userId = '';
+      if (typeof messageData.from === 'string') {
+        userId = messageData.from;
+      } else if (typeof messageData.from === 'object' && messageData.from !== null) {
+        userId = messageData.from.userid || '';
+      }
+      
+      // 根据聊天类型构建chatId
+      let chatId;
+      const chatType = messageData.chattype || 'single';
+      if (chatType === 'group') {
+        const groupId = messageData.chatid || 'unknown_group';
+        chatId = `wechat_group_${groupId}_${userId}`;
+      } else {
+        chatId = `wechat_single_${userId}`;
+      }
+      
+      console.log(`[对话ID]`);
+      console.log(chatId);
+      console.log(`[用户问题]`);
+      console.log(messageData.text.content);
+    }
+    
     // 处理消息
     let response;
     if (messageData.msgtype === 'stream') {
@@ -267,8 +293,8 @@ if (useCluster && cluster.isMaster) {
       requestMap.clear();
       
       // 如果消息处理器有清理方法
-      if (messageHandler.cleanup) {
-        messageHandler.cleanup();
+      if (messageHandler.shutdown) {
+        messageHandler.shutdown();
       }
       
       process.exit(0);
