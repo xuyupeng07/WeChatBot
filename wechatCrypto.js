@@ -1,4 +1,4 @@
-const crypto = require('crypto');
+import crypto from 'crypto';
 
 class WechatCrypto {
   constructor(token, aesKey, corpId) {
@@ -99,4 +99,4 @@ class WechatCrypto {
   }
 }
 
-module.exports = WechatCrypto;
+export default WechatCrypto;

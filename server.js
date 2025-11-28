@@ -1,54 +1,79 @@
-require('dotenv').config();
-const express = require('express');
-const bodyParser = require('body-parser');
-const cluster = require('cluster');
-const os = require('os');
-const WechatCrypto = require('./wechatCrypto');
-const MessageHandler = require('./messageHandler');
+import dotenv from 'dotenv';
+dotenv.config();
+
+// 修正无效的 SERVER_HOST，确保使用公网域名
+if (process.env.SERVER_HOST === '127.0.0.1' || process.env.SERVER_HOST === 'localhost') {
+  console.log(`[STARTUP WARNING] 检测到无效的SERVER_HOST: ${process.env.SERVER_HOST}，使用公网域名`);
+  process.env.SERVER_HOST = 'https://npzfibxxgmmk.sealoshzh.site';
+}
+import express from 'express';
+import bodyParser from 'body-parser';
+import cluster from 'cluster';
+import os from 'os';
+import WechatCrypto from './wechatCrypto.js';
+import MessageHandler from './messageHandler.js';
+import { getServerConfig } from './constants/config.js';
+import multer from 'multer';
+
+let messageHandler;
+async function initMessageHandler() {
+  messageHandler = new MessageHandler();
+}
 
 const app = express();
-const port = process.env.PORT || 3001;
-const maxConcurrency = parseInt(process.env.MAX_CONCURRENCY) || 100;
-const requestTimeout = parseInt(process.env.REQUEST_TIMEOUT) || 30000;
+const serverConfig = getServerConfig();
+const port = serverConfig.port;
+const maxConcurrency = serverConfig.maxConcurrency;
+const requestTimeout = serverConfig.requestTimeout;
 
 // 全局错误计数器
 let errorCount = 0;
-let lastErrorTime = 0;
 
 // 中间件 - 安全限制
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
 // 请求限流中间件
-const requestMap = new Map();
-const cleanupInterval = 60000; // 1分钟清理一次
+const activeRequestsByIp = new Map();
+const cleanupInterval = 60000;
 
 const rateLimitMiddleware = (req, res, next) => {
-  const clientIP = req.ip || req.connection.remoteAddress;
-  const now = Date.now();
-  
-  // 清理过期记录
-  if (now - lastErrorTime > cleanupInterval) {
-    requestMap.clear();
-    lastErrorTime = now;
-  }
-  
-  const clientRequests = requestMap.get(clientIP) || 0;
-  if (clientRequests >= maxConcurrency) {
+  const clientIP = req.ip || req.connection.remoteAddress || 'unknown_ip';
+  const record = activeRequestsByIp.get(clientIP) || { count: 0, lastSeen: Date.now() };
+  if (record.count >= maxConcurrency) {
     return res.status(429).json({ error: '请求过于频繁，请稍后再试' });
   }
-  
-  requestMap.set(clientIP, clientRequests + 1);
-  
-  // 设置请求超时
+  record.count += 1;
+  record.lastSeen = Date.now();
+  activeRequestsByIp.set(clientIP, record);
+
   req.setTimeout(requestTimeout, () => {
-    res.status(408).json({ error: '请求超时' });
+    try { res.status(408).json({ error: '请求超时' }); } catch (_) {}
   });
-  
+
+  const done = () => {
+    const cur = activeRequestsByIp.get(clientIP);
+    if (!cur) return;
+    cur.count = Math.max(0, (cur.count || 1) - 1);
+    cur.lastSeen = Date.now();
+    if (cur.count === 0) activeRequestsByIp.delete(clientIP);
+    else activeRequestsByIp.set(clientIP, cur);
+  };
+  res.on('finish', done);
+  res.on('close', done);
   next();
 };
 
 app.use(rateLimitMiddleware);
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of activeRequestsByIp) {
+    if ((now - rec.lastSeen) > cleanupInterval || (rec.count || 0) === 0) {
+      activeRequestsByIp.delete(ip);
+    }
+  }
+}, cleanupInterval);
 
 // 配置验证
 function validateConfig() {
@@ -76,34 +101,57 @@ const wechatCrypto = new WechatCrypto(
   process.env.WECHAT_CORP_ID
 );
 
-const messageHandler = new MessageHandler();
+// 静态文件服务 - 用于提供下载的图片
+import path from 'path';
+app.use('/public', express.static(path.join(process.cwd(), 'public')));
+
+// 简单直传接口：如果 COS 链接不可直接下载，可由前端直接上传图片到本服务器，再生成公网 URL 给 FastGPT
+const upload = multer({ dest: path.join(process.cwd(), 'public', 'images') });
+app.post('/upload', upload.single('file'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: '未找到上传文件' });
+  }
+  const serverHost = process.env.SERVER_HOST || `http://localhost:${port}`;
+  const url = `${serverHost}/public/images/${req.file.filename}`;
+  res.json({ url });
+});
+
+// 图片代理路由 - 已移除，改用直接处理
+// 格式: /proxy/image?url=<encoded_url>
+// app.get('/proxy/image', async (req, res) => {
+//     ...
+// });
+
+
+// 延迟初始化，确保在启动服务器前加载ESM模块
+// messageHandler 将在启动前完成赋值
 
 // 健康检查接口
-  app.get('/health', (req, res) => {
-    const healthStatus = messageHandler.getHealthStatus();
-    res.json({
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-      pid: process.pid,
-      ...healthStatus
-    });
+app.get('/health', (req, res) => {
+  const healthStatus = messageHandler.getHealthStatus();
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    pid: process.pid,
+    ...healthStatus
   });
+});
 
-  // 系统统计接口
-  app.get('/stats', (req, res) => {
-    const stats = messageHandler.getStats();
-    res.json({
-      timestamp: new Date().toISOString(),
-      pid: process.pid,
-      ...stats
-    });
+// 系统统计接口
+app.get('/stats', (req, res) => {
+  const stats = messageHandler.getStats();
+  res.json({
+    timestamp: new Date().toISOString(),
+    pid: process.pid,
+    ...stats
   });
+});
 
-  // 重置统计接口
-  app.post('/stats/reset', (req, res) => {
-    messageHandler.resetStats();
-    res.json({ success: true, message: '统计信息已重置' });
-  });
+// 重置统计接口
+app.post('/stats/reset', (req, res) => {
+  messageHandler.resetStats();
+  res.json({ success: true, message: '统计信息已重置' });
+});
 
 // 企业微信回调接口 - GET请求用于验证URL
 app.get('/wechat/callback', (req, res) => {
@@ -247,7 +295,7 @@ function startServer() {
 }
 
 // 根据配置决定是否使用集群
-const useCluster = process.env.CLUSTER_MODE === 'true';
+const useCluster = serverConfig.useCluster;
 
 if (useCluster && cluster.isMaster) {
   const numCPUs = os.cpus().length;
@@ -279,8 +327,10 @@ if (useCluster && cluster.isMaster) {
   });
 
 } else {
-  // 启动服务器
-  const server = startServer();
+  // 启动服务器（在初始化消息处理器后）
+  initMessageHandler()
+    .then(() => {
+      const server = startServer();
 
   // 优雅关闭
   const gracefulShutdown = (signal) => {
@@ -290,7 +340,7 @@ if (useCluster && cluster.isMaster) {
       console.log('服务器已关闭');
       
       // 清理资源
-      requestMap.clear();
+      activeRequestsByIp.clear();
       
       // 如果消息处理器有清理方法
       if (messageHandler.shutdown) {
@@ -307,11 +357,11 @@ if (useCluster && cluster.isMaster) {
     }, 10000);
   };
 
-  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+      process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+      process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
   // 未捕获异常处理
-  process.on('uncaughtException', (error) => {
+      process.on('uncaughtException', (error) => {
     console.error(`未捕获异常: ${error.message}`);
     console.error(error.stack);
     errorCount++;
@@ -322,7 +372,7 @@ if (useCluster && cluster.isMaster) {
     }
   });
 
-  process.on('unhandledRejection', (reason, promise) => {
+      process.on('unhandledRejection', (reason, promise) => {
     console.error(`未处理的Promise拒绝: ${reason}`);
     console.error(promise);
     errorCount++;
@@ -332,4 +382,9 @@ if (useCluster && cluster.isMaster) {
       process.exit(1);
     }
   });
+    })
+    .catch((error) => {
+      console.error('消息处理器初始化失败', error);
+      process.exit(1);
+    });
 }
