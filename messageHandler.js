@@ -321,6 +321,8 @@ class MessageHandler {
   
   createStreamResponse(content, finish = true, images = [], streamId = null) { return responses.createStreamResponse(content, finish, images, streamId); }
 
+  createTemplateCardResponse(templateCard) { return responses.createTemplateCardResponse(templateCard); }
+
   printAIReply(resp) { return responses.printAIReply(resp); }
 
   extractUserId(from) { return helpers.extractUserId(from); }
