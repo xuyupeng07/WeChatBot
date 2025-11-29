@@ -1,19 +1,10 @@
-// 图片消息处理：初始化流式会话与AI调用（带图片）
 import { buildChatIdFromMessage } from '../utils/helpers.js';
 import { downloadAndSaveImage } from '../utils/wechat.js';
 import fs from 'fs';
 
-export const processImmediateAIStreamWithImage = async (ctx, content, imageUrl, streamId) => {
+export const prepareImageAttachment = async (ctx, imageUrl) => {
   let localImagePath = null;
   try {
-    const streamState = ctx.streamStore.get(streamId);
-    if (!streamState) return;
-    streamState.aiResponse = '';
-    streamState.streamContent = '';
-    streamState.isStreaming = true;
-    const chatId = buildChatIdFromMessage(streamState.messageData);
-    const requestId = ctx.createRequestId();
-
     // 1. 下载图片到本地 public 目录
     // 使用外部配置的 SERVER_HOST 作为公开访问域名
     const serverHost = process.env.SERVER_HOST;
@@ -33,15 +24,37 @@ export const processImmediateAIStreamWithImage = async (ctx, content, imageUrl, 
     }
     ctx.log('debug', 'Image available at public URL', { publicImageUrl });
     
+    return {
+        publicImageUrl,
+        localImagePath
+    };
+  } catch (error) {
+      throw error;
+  }
+};
+
+export const processImmediateAIStreamWithImage = async (ctx, content, imageUrl, streamId) => {
+  let localImagePath = null;
+  try {
+    const streamState = ctx.streamStore.get(streamId);
+    if (!streamState) return;
+    streamState.aiResponse = '';
+    streamState.streamContent = '';
+    streamState.isStreaming = true;
+    const chatId = buildChatIdFromMessage(streamState.messageData);
+    const requestId = ctx.createRequestId();
+
+    const imageInfo = await prepareImageAttachment(ctx, imageUrl);
+    localImagePath = imageInfo.localImagePath;
+    const { publicImageUrl } = imageInfo;
+    
     // 构建带图片的请求数据
-    const requestData = ctx.buildFastGPTRequestData(chatId, content || '图片内容分析', true);
-    // 注入图片
-    requestData.messages[0].content.push({
-        type: 'image_url',
-        image_url: {
+    const requestData = ctx.buildFastGPTRequestData(chatId, content || '图片内容分析', true, [
+        {
+            type: 'image',
             url: publicImageUrl
         }
-    });
+    ]);
 
     const config = ctx.buildAxiosConfig(true);
 

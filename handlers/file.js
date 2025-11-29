@@ -4,6 +4,47 @@ import fs from 'fs';
 import path from 'path';
 
 /**
+ * 准备文件附件（下载并构建URL）
+ */
+export const prepareFileAttachment = async (ctx, messageData) => {
+    let localFilePath = null;
+    try {
+        const { file } = messageData;
+    ctx.log('debug', 'File message data received', { 
+        filename: file.filename, 
+        fileext: file.fileext,
+        filesize: file.filesize
+    });
+    const fileUrl = file.url;
+        
+        // 下载并解密文件
+        localFilePath = await downloadAndSaveFile(fileUrl, file.filename);
+        
+        // 验证文件
+        const stat = fs.statSync(localFilePath);
+        if (!stat || stat.size === 0) {
+            throw new Error('Downloaded file is empty or invalid');
+        }
+
+        // 构建公开访问URL
+        const serverHost = process.env.SERVER_HOST;
+        const fileName = path.basename(localFilePath);
+        const host = (serverHost && !serverHost.includes('127.0.0.1') && !serverHost.includes('localhost'))
+            ? serverHost
+            : 'https://npzfibxxgmmk.sealoshzh.site';
+        const publicFileUrl = `${host}/public/files/${fileName}`;
+        
+        return {
+            fileName,
+            publicFileUrl,
+            localFilePath
+        };
+    } catch (error) {
+        throw error;
+    }
+};
+
+/**
  * 处理文件消息
  * @param {object} ctx MessageHandler 实例
  * @param {object} messageData 消息数据
@@ -11,7 +52,6 @@ import path from 'path';
 export const handleFileMessage = async (ctx, messageData) => {
   try {
     const { file } = messageData;
-    const fileUrl = file.url;
     
     // 初始化流式响应状态
     // 文件消息可能需要较长时间处理，先建立流式连接
@@ -59,22 +99,9 @@ const processFileAndCallAI = async (ctx, messageData, streamId) => {
         
         ctx.log('debug', 'Starting file download process', { fileUrl });
         
-        // 下载并解密文件
-        localFilePath = await downloadAndSaveFile(fileUrl);
-        
-        // 验证文件
-        const stat = fs.statSync(localFilePath);
-        if (!stat || stat.size === 0) {
-            throw new Error('Downloaded file is empty or invalid');
-        }
-
-        // 构建公开访问URL
-        const serverHost = process.env.SERVER_HOST;
-        const fileName = path.basename(localFilePath);
-        const host = (serverHost && !serverHost.includes('127.0.0.1') && !serverHost.includes('localhost'))
-            ? serverHost
-            : 'https://npzfibxxgmmk.sealoshzh.site';
-        const publicFileUrl = `${host}/public/files/${fileName}`;
+        const fileInfo = await prepareFileAttachment(ctx, messageData);
+        localFilePath = fileInfo.localFilePath;
+        const { fileName, publicFileUrl } = fileInfo;
         
         ctx.log('debug', 'File available at public URL', { publicFileUrl });
         
@@ -83,41 +110,22 @@ const processFileAndCallAI = async (ctx, messageData, streamId) => {
         const requestId = ctx.createRequestId();
         
         // 构建AI请求数据
-        // 根据FastGPT文档，文件通常作为 file_url 类型传入
-        // 注意：目前FastGPT API对于文件处理的具体格式可能有所不同，这里按照用户提供的示例构建
+        // 如果没有额外的文本描述，就只发送文件
+        let content = '';
+        // 这里需要检查是否是混合消息（带文字的文件消息），目前我们假设单独的文件消息没有文字
+        // 如果需要支持文件配文字，可能需要调整 handleMixedMessage 或在这里处理
+        // 暂时保持空，让FastGPT自己处理文件内容，或者根据需求添加默认提示
+        // 用户要求：没有文字说明就不发 text 对象
         
-        /* 
-        用户提供的示例:
-        {
-            "type": "file_url",
-            "name": "文件名",
-            "url": "文档链接"
-        }
-        */
-        
-        // 我们假设默认提示词是“分析这个文件”
-        const content = '请分析上传的文件内容';
-        const requestData = ctx.buildFastGPTRequestData(chatId, content, true);
-        
-        // 注入文件信息
-        // 替换默认的 text content 或者 追加到 content list
-        // 检查 requestData.messages[0].content 是否为数组，如果不是则转为数组
-        if (!Array.isArray(requestData.messages[0].content)) {
-            requestData.messages[0].content = [{
-                type: 'text',
-                text: requestData.messages[0].content
-            }];
-        }
-        
-        // 添加文件对象
-        // 由于不知道原始文件名，我们尝试从 localFilePath 或 URL 中推断，或者使用默认名称
-        // 微信回调中没有提供文件名，可能需要尝试解析 Content-Disposition 或直接使用 generated ID
-        requestData.messages[0].content.push({
-            type: 'file_url',
-            name: fileName, // 使用本地生成的文件名
-            url: publicFileUrl
-        });
+        const requestData = ctx.buildFastGPTRequestData(chatId, content, true, [
+            {
+                type: 'file',
+                name: fileName,
+                url: publicFileUrl
+            }
+        ]);
 
+        
         const config = ctx.buildAxiosConfig(true);
 
         const streamCallback = (chunk, isComplete) => {

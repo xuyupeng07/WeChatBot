@@ -3,7 +3,6 @@ dotenv.config();
 
 // 修正无效的 SERVER_HOST，确保使用公网域名
 if (process.env.SERVER_HOST === '127.0.0.1' || process.env.SERVER_HOST === 'localhost') {
-  console.log(`[STARTUP WARNING] 检测到无效的SERVER_HOST: ${process.env.SERVER_HOST}，使用公网域名`);
   process.env.SERVER_HOST = 'https://npzfibxxgmmk.sealoshzh.site';
 }
 import express from 'express';
@@ -115,13 +114,6 @@ app.post('/upload', upload.single('file'), (req, res) => {
   const url = `${serverHost}/public/images/${req.file.filename}`;
   res.json({ url });
 });
-
-// 图片代理路由 - 已移除，改用直接处理
-// 格式: /proxy/image?url=<encoded_url>
-// app.get('/proxy/image', async (req, res) => {
-//     ...
-// });
-
 
 // 延迟初始化，确保在启动服务器前加载ESM模块
 // messageHandler 将在启动前完成赋值
@@ -276,9 +268,32 @@ app.use((req, res) => {
   res.status(404).json({ error: '接口不存在' });
 });
 
+import { cleanupOldFiles } from './utils/cleanup.js';
+import { fileURLToPath } from 'url';
+
+// 获取当前文件的目录
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// 定义要清理的目录和时间
+const FILES_DIR = path.join(__dirname, 'public/files');
+const IMAGES_DIR = path.join(__dirname, 'public/images');
+const MAX_FILE_AGE = 5 * 60 * 1000; // 5分钟
+const CLEANUP_CHECK_INTERVAL = 60 * 1000; // 每分钟检查一次
+
+// 启动定时清理任务
+setInterval(() => {
+  cleanupOldFiles(FILES_DIR, MAX_FILE_AGE);
+  cleanupOldFiles(IMAGES_DIR, MAX_FILE_AGE);
+}, CLEANUP_CHECK_INTERVAL);
+
+// 立即执行一次清理
+cleanupOldFiles(FILES_DIR, MAX_FILE_AGE);
+cleanupOldFiles(IMAGES_DIR, MAX_FILE_AGE);
+
 // 集群模式启动
 function startServer() {
-  const server = app.listen(port, () => {
+  const server = app.listen(port, '0.0.0.0', () => {
     console.log(`企业微信智能机器人服务器启动成功 (进程 ${process.pid})`);
     console.log(`端口: ${port}`);
     console.log(`回调地址: http://localhost:${port}/wechat/callback`);

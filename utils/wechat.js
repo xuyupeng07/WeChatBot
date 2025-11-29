@@ -40,42 +40,6 @@ export const getAccessToken = async () => {
     }
 };
 
-/**
- * 直接下载图片并转换为 Base64
- * 尝试两种策略：
- * 1. 尝试直接下载（添加 User-Agent 等头）
- * 2. 如果失败，尝试作为临时素材下载（需要 Media ID，但通常图片回调只给 URL，所以此方法可能需要额外的 media_id）
- *    注意：企业微信回调的图片消息通常只包含 url，不包含 media_id。
- *    但是，回调的 URL 通常是受保护的，需要特定的 Header 或 Cookie，或者它是内网/特定签名的 URL。
- *    根据用户提供的 URL 样例，它带有很多签名参数。
- * 
- * 改进策略：
- * 用户提示使用 `axios.get(imageUrl, { headers: ... })` 方案。
- * 
- * @param {string} imageUrl 
- * @returns {Promise<string>} Base64 string
- */
-export const downloadImageAsBase64 = async (imageUrl) => {
-    try {
-        // 尝试方案2：直接下载，带上模拟的浏览器 Header
-        const response = await axios.get(imageUrl, {
-            responseType: 'arraybuffer',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Referer': 'https://work.weixin.qq.com/'
-            },
-            timeout: 10000
-        });
-        
-        const base64 = Buffer.from(response.data, 'binary').toString('base64');
-        const mimeType = response.headers['content-type'] || 'image/jpeg';
-        return `data:${mimeType};base64,${base64}`;
-    } catch (error) {
-        log('warn', 'Direct image download failed, trying alternative if available', { error: error.message });
-        throw new Error(`Failed to download image: ${error.message}`);
-    }
-};
-
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -159,86 +123,13 @@ export const downloadAndSaveImage = async (imageUrl) => {
     }
 };
 
-
-import { fileTypeFromBuffer } from 'file-type';
-
-/**
- * Check if buffer is text
- */
-const isText = (buffer) => {
-    // Check first 1000 bytes for null bytes
-    const checkLen = Math.min(buffer.length, 1000);
-    for (let i = 0; i < checkLen; i++) {
-        if (buffer[i] === 0x00) return false;
-    }
-    return true;
-};
-
-/**
- * 简单文件扩展名推断
- */
-const detectFileExt = async (buffer, contentType, url, contentDisposition) => {
-    // 0. 优先从 Content-Disposition 获取文件名
-    if (contentDisposition) {
-        // 尝试匹配 filename="xxx" 或 filename=xxx
-        const match = contentDisposition.match(/filename=["']?([^"';]+)["']?/);
-        if (match && match[1]) {
-            const ext = path.extname(match[1]).replace('.', '');
-            if (ext) return ext;
-        }
-    }
-
-    // 1. 尝试从 buffer 内容推断 (file-type 擅长二进制格式)
-    try {
-        const type = await fileTypeFromBuffer(buffer);
-        if (type && type.ext) {
-            return type.ext;
-        }
-    } catch (e) {
-        // ignore error
-    }
-
-    // 2. 从 Content-Type 推断
-    const mimeMap = {
-        'application/pdf': 'pdf',
-        'application/msword': 'doc',
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
-        'application/vnd.ms-excel': 'xls',
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
-        'application/vnd.ms-powerpoint': 'ppt',
-        'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
-        'text/plain': 'txt',
-        'text/markdown': 'md',
-        'text/csv': 'csv',
-        'image/jpeg': 'jpg',
-        'image/png': 'png',
-        'image/gif': 'gif',
-        'application/json': 'json',
-        'application/xml': 'xml'
-    };
-    if (mimeMap[contentType]) return mimeMap[contentType];
-    
-    // 3. 从 URL 尝试
-    try {
-        const urlObj = new URL(url);
-        const ext = path.extname(urlObj.pathname).replace('.', '');
-        if (ext) return ext;
-    } catch (e) {}
-
-    // 4. 最后尝试检测是否为纯文本
-    if (isText(buffer)) {
-        return 'txt';
-    }
-    
-    return 'bin';
-};
-
 /**
  * 下载文件并保存到本地 public 目录 (处理加密)
  * @param {string} fileUrl 
+ * @param {string} [originalFileName] 原始文件名（可选）
  * @returns {Promise<string>} 本地文件路径
  */
-export const downloadAndSaveFile = async (fileUrl) => {
+export const downloadAndSaveFile = async (fileUrl, originalFileName) => {
     try {
         const publicDir = path.join(process.cwd(), 'public', 'files');
         if (!fs.existsSync(publicDir)) {
@@ -296,53 +187,102 @@ export const downloadAndSaveFile = async (fileUrl) => {
 
         const contentType = (response.headers['content-type'] || '').toLowerCase();
         const contentDisposition = response.headers['content-disposition'] || '';
-        const ext = await detectFileExt(outputBuffer, contentType, fileUrl, contentDisposition);
-        const fileName = `${crypto.randomUUID()}.${ext}`;
+        const xCosMetaAttr = response.headers['x-cos-meta-attr'] || '';
+        
+        log('debug', 'File download headers', { contentType, contentDisposition, xCosMetaAttr });
+
+        let fileName;
+        
+        // 优先尝试从 x-cos-meta-attr 中解析文件名（腾讯云 COS 特有，包含原始文件名）
+        if (xCosMetaAttr) {
+            try {
+                const decodedBuffer = Buffer.from(xCosMetaAttr, 'base64');
+                
+                // 简单的 Protobuf 字段 1 (index 1, wire type 2 -> 0x0A) 解析
+                let offset = 0;
+                while (offset < decodedBuffer.length) {
+                    const tag = decodedBuffer[offset];
+                    const fieldNumber = tag >> 3;
+                    const wireType = tag & 0x07;
+                    offset++;
+                    
+                    if (wireType === 2) { // Length-delimited (String, Bytes, etc.)
+                          // 读取长度（varint，这里简化假设单字节长度，通常文件名不会太长）
+                          const length = decodedBuffer[offset];
+                          offset++;
+                          
+                          if (fieldNumber === 1) { // 假设 Field 1 是文件名
+                              if (offset + length <= decodedBuffer.length) {
+                                  fileName = decodedBuffer.slice(offset, offset + length).toString('utf8');
+                              }
+                              break; 
+                          } else {
+                              offset += length;
+                          }
+                     } else {
+                        break; 
+                    }
+                }
+                
+                // 如果 protobuf 解析失败，尝试正则匹配作为回退
+                if (!fileName) {
+                     const rawStr = decodedBuffer.toString('utf8');
+                     const match = rawStr.match(/[\u4e00-\u9fa5a-zA-Z0-9_\-\s]+\.[a-zA-Z0-9]+/);
+                     if (match) {
+                         fileName = match[0];
+                     }
+                }
+
+            } catch (e) {
+                log('warn', 'Failed to parse x-cos-meta-attr', { error: e.message });
+            }
+        }
+        
+        // 其次尝试从 Content-Disposition 中提取文件名 (标准 HTTP 头)
+        if (!fileName && contentDisposition) {
+            // 尝试匹配 filename*=utf-8''xxxx (RFC 5987)
+            const matchUtf8 = contentDisposition.match(/filename\*=utf-8''([^;]+)/i);
+            if (matchUtf8 && matchUtf8[1]) {
+                fileName = decodeURIComponent(matchUtf8[1]);
+            } else {
+                // 尝试匹配 filename="xxx"
+                const match = contentDisposition.match(/filename=["']?([^"';]+)["']?/i);
+                if (match && match[1]) {
+                    // 有些时候文件名可能是 URL 编码的
+                    try {
+                        fileName = decodeURIComponent(match[1]);
+                    } catch (e) {
+                        fileName = match[1];
+                    }
+                }
+            }
+        }
+
+        if (originalFileName && !fileName) {
+            fileName = originalFileName;
+        } else if (!fileName) {
+             // 如果无法解析文件名，使用随机名 + .txt 后缀（因为我们已经删除了 detectFileExt 这种不可靠的推断）
+            fileName = `${crypto.randomUUID()}.txt`;
+        }
+        
+        // 确保文件名安全
+        fileName = fileName.replace(/[\/\\]/g, '_');
+        
+        // 如果没有后缀，尝试从 originalFileName 补全，或者默认 .txt
+        if (!path.extname(fileName)) {
+             if (originalFileName && path.extname(originalFileName)) {
+                 fileName = `${fileName}${path.extname(originalFileName)}`;
+             } else {
+                 fileName = `${fileName}.txt`;
+             }
+        }
+        
         const filePath = path.join(publicDir, fileName);
         fs.writeFileSync(filePath, outputBuffer);
 
         return filePath;
     } catch (error) {
         log('error', 'Failed to download and save file', { error: error.message });
-        throw error;
-    }
-};
-
-/**
- * 获取图片流 (用于代理)
- * @param {string} imageUrl 
- * @returns {Promise<import('stream').Readable>}
- */
-export const getImageStream = async (imageUrl) => {
-    try {
-        // 经过测试，腾讯云COS的图片链接可以直接下载，不需要特殊的 User-Agent 或 Referer
-        // 实际上，带了错误的 Referer 反而可能导致问题，或者 User-Agent 限制
-        // 最简单的方式通常最有效，但也保留基本的 User-Agent 模拟浏览器
-        
-        // 注意：必须设置 responseType: 'stream' 以便后续 pipe
-        const response = await axios.get(imageUrl, {
-            responseType: 'stream',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            },
-            timeout: 20000
-        });
-        return response;
-    } catch (error) {
-        log('error', 'Failed to get image stream', { error: error.message });
-        // 如果第一次失败，尝试完全不带 Header 重试
-        if (error.response && error.response.status === 403) {
-             try {
-                log('warn', 'Retrying without headers');
-                const response = await axios.get(imageUrl, {
-                    responseType: 'stream',
-                    timeout: 20000
-                });
-                return response;
-            } catch (retryError) {
-                throw retryError;
-            }
-        }
         throw error;
     }
 };

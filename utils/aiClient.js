@@ -1,24 +1,46 @@
 // AI客户端与请求封装
 import axios from 'axios';
 
-export const buildFastGPTRequestData = (chatId, content, stream, imageUrl = null) => {
-  const messages = [
-    {
-      role: 'user',
-      content: [
-        { type: 'text', text: content }
-      ]
-    }
-  ];
+export const buildFastGPTRequestData = (chatId, content, stream, attachments = []) => {
+  const messageContent = [];
+  
+  if (content) {
+      messageContent.push({ type: 'text', text: content });
+  }
 
-  if (imageUrl) {
-    messages[0].content.push({
+  if (Array.isArray(attachments)) {
+    attachments.forEach(item => {
+      if (item.type === 'image') {
+        messageContent.push({
+          type: 'image_url',
+          image_url: {
+            url: item.url
+          }
+        });
+      } else if (item.type === 'file') {
+        messageContent.push({
+          type: 'file_url',
+          name: item.name,
+          url: item.url
+        });
+      }
+    });
+  } else if (typeof attachments === 'string') {
+    // Backward compatibility for imageUrl as string
+    messageContent.push({
       type: 'image_url',
       image_url: {
-        url: imageUrl
+        url: attachments
       }
     });
   }
+
+  const messages = [
+    {
+      role: 'user',
+      content: messageContent
+    }
+  ];
 
   return {
     chatId,
@@ -89,13 +111,17 @@ export const handleStreamRequest = async (aiApiUrl, requestData, config, streamC
     activeStreams.set(requestId, { startTime: Date.now(), userId: requestData.chatId });
     let fullContent = '';
     let buffer = '';
+    
     return new Promise((resolve, reject) => {
       response.data.on('data', (chunk) => {
         try {
           buffer += chunk.toString();
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
+          // 检查buffer中是否包含完整的行
+          let newlineIndex;
+          while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, newlineIndex).trim();
+            buffer = buffer.slice(newlineIndex + 1);
+            
             if (line.startsWith('data: ')) {
               const data = line.slice(6).trim();
               if (data === '[DONE]') {
@@ -112,7 +138,10 @@ export const handleStreamRequest = async (aiApiUrl, requestData, config, streamC
                   streamCallback(content, false);
                 }
               } catch (e) {
-                // ignore invalid JSON
+                // JSON解析失败通常是因为数据不完整，这种情况下我们不应该丢弃数据
+                // 但在SSE协议中，一行应该是一个完整的JSON
+                // 如果这里解析失败，可能是因为收到的不是JSON，或者是FastGPT特有的错误格式
+                log('warn', 'JSON parse warning', { requestId, data: data.substring(0, 50), error: e.message });
               }
             }
           }
@@ -121,6 +150,24 @@ export const handleStreamRequest = async (aiApiUrl, requestData, config, streamC
         }
       });
       response.data.on('end', () => {
+        // 处理剩余的 buffer
+        if (buffer.length > 0 && buffer.startsWith('data: ')) {
+             // 尝试处理最后可能残留的数据
+             try {
+                 const data = buffer.slice(6).trim();
+                 if (data !== '[DONE]') {
+                     const parsed = JSON.parse(data);
+                     if (parsed.choices?.[0]?.delta?.content) {
+                         const content = parsed.choices[0].delta.content;
+                         fullContent += content;
+                         streamCallback(content, false);
+                     }
+                 }
+             } catch (e) {
+                 // ignore
+             }
+        }
+        
         activeStreams.delete(requestId);
         streamCallback('', true);
         resolve(fullContent);

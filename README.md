@@ -77,7 +77,7 @@ npm start
 ### 4. 配置企业微信
 
 1. 在企业微信管理后台创建智能机器人
-2. 设置回调URL为：`http://your-domain:3001/wechat/callback`
+2. 设置回调URL为：`http://your-domain:3002/wechat/callback`
 3. 配置Token、AESKey等参数
 4. 保存配置并验证URL
 
