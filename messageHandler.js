@@ -145,6 +145,9 @@ class MessageHandler {
       let mainMsgId = messages[0].msgid;
       let targetMessageData = messages[0];
 
+      // We need to preserve order if possible, or sort by msgid/time
+      // Assuming messages array is in order of arrival (push)
+      
       for (const msg of messages) {
           if (msg.msgtype === 'text') {
               textContent += msg.text.content + ' ';
@@ -164,15 +167,10 @@ class MessageHandler {
       // Logic to handle combination
       // Case 1: Text + File
       // Case 2: Text + Image
-      // Case 3: Multiple Files/Images (maybe just take first for now or support list)
+      // Case 3: Multiple Files/Images
       
-      // For now, we support 1 Text + 1 Attachment (File or Image) primarily, 
-      // but FastGPT API supports multiple.
-      
+      // If we have attachments, we process all of them
       if (attachments.length > 0) {
-          // Use the first attachment's type to decide handler, or a generic one?
-          // We need a new handler for "Text + Attachments"
-          
           return await this.handleTextWithAttachments(targetMessageData, textContent, attachments);
       }
 
@@ -227,7 +225,7 @@ class MessageHandler {
               }
           }
 
-          const content = textContent || (preparedAttachments[0].type === 'file' ? '请分析上传的文件' : '请分析这张图片');
+          const content = textContent || '';
           
           const requestData = this.buildFastGPTRequestData(chatId, content, true, preparedAttachments);
           const config = this.buildAxiosConfig(true);

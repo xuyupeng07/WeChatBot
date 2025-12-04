@@ -67,6 +67,96 @@ const detectImageExt = (buf) => {
     return 'jpg';
 };
 
+
+/**
+ * 从响应头解析文件名
+ * @param {object} headers HTTP响应头
+ * @returns {string|null} 解析出的文件名
+ */
+const extractFilenameFromHeaders = (headers) => {
+    const contentDisposition = headers['content-disposition'] || '';
+    const xCosMetaAttr = headers['x-cos-meta-attr'] || '';
+    let fileName = null;
+
+    // 1. 优先尝试从 x-cos-meta-attr 中解析文件名（腾讯云 COS 特有）
+    if (xCosMetaAttr) {
+        try {
+            const decodedBuffer = Buffer.from(xCosMetaAttr, 'base64');
+            
+            // Protobuf 解析逻辑
+            let offset = 0;
+            while (offset < decodedBuffer.length) {
+                const tag = decodedBuffer[offset];
+                const fieldNumber = tag >> 3;
+                const wireType = tag & 0x07;
+                offset++;
+                
+                if (wireType === 2) { // Length-delimited
+                    let length = 0;
+                    let shift = 0;
+                    while (true) {
+                        if (offset >= decodedBuffer.length) break;
+                        const byte = decodedBuffer[offset];
+                        length |= (byte & 0x7f) << shift;
+                        offset++;
+                        shift += 7;
+                        if ((byte & 0x80) === 0) break;
+                    }
+                    
+                    if (fieldNumber === 1) { // Field 1 是文件名
+                        if (offset + length <= decodedBuffer.length) {
+                            fileName = decodedBuffer.slice(offset, offset + length).toString('utf8');
+                        }
+                        // 继续解析以防万一
+                    } 
+                    offset += length;
+                } else if (wireType === 0) { // Varint
+                    while (true) {
+                        if (offset >= decodedBuffer.length) break;
+                        const byte = decodedBuffer[offset];
+                        offset++;
+                        if ((byte & 0x80) === 0) break;
+                    }
+                } else if (wireType === 5) { // 32-bit
+                    offset += 4;
+                } else if (wireType === 1) { // 64-bit
+                    offset += 8;
+                } else {
+                    break; 
+                }
+            }
+            
+            // 如果 protobuf 解析失败，尝试正则匹配
+            if (!fileName) {
+                 const rawStr = decodedBuffer.toString('utf8');
+                 const match = rawStr.match(/[\u4e00-\u9fa5a-zA-Z0-9_\-\s]+\.[a-zA-Z0-9]+/);
+                 if (match) fileName = match[0];
+            }
+        } catch (e) {
+            log('warn', 'Failed to parse x-cos-meta-attr', { error: e.message });
+        }
+    }
+    
+    // 2. 尝试从 Content-Disposition 中提取
+    if (!fileName && contentDisposition) {
+        const matchUtf8 = contentDisposition.match(/filename\*=utf-8''([^;]+)/i);
+        if (matchUtf8 && matchUtf8[1]) {
+            fileName = decodeURIComponent(matchUtf8[1]);
+        } else {
+            const match = contentDisposition.match(/filename=["']?([^"';]+)["']?/i);
+            if (match && match[1]) {
+                try {
+                    fileName = decodeURIComponent(match[1]);
+                } catch (e) {
+                    fileName = match[1];
+                }
+            }
+        }
+    }
+
+    return fileName;
+};
+
 export const downloadAndSaveImage = async (imageUrl) => {
     try {
         const publicDir = path.join(process.cwd(), 'public', 'images');
@@ -112,7 +202,30 @@ export const downloadAndSaveImage = async (imageUrl) => {
             outputBuffer = decrypted.slice(0, decrypted.length - padLen);
         }
         const ext = detectImageExt(outputBuffer);
-        const fileName = `${crypto.randomUUID()}.${ext}`;
+        
+        // 尝试从Header提取文件名
+        const extractedName = extractFilenameFromHeaders(response.headers);
+        let fileName = extractedName;
+
+        if (!fileName) {
+             fileName = `${crypto.randomUUID()}.${ext}`;
+        } else {
+            // 确保后缀名正确
+            const extractedExt = path.extname(fileName).replace('.', '');
+            if (!extractedExt || extractedExt !== ext) {
+                // 如果提取的文件名后缀与检测到的类型不符，或者没有后缀，使用检测到的后缀
+                // 这里保留原文件名主体，只修正后缀? 或者直接追加?
+                // 简单策略：如果原文件名没后缀，追加。如果有，信任原文件名(可能有特例)，或者强行修正
+                // 为了安全，如果检测出是图片，最好确保后缀也是图片格式
+                if (!path.extname(fileName)) {
+                    fileName = `${fileName}.${ext}`;
+                }
+            }
+        }
+        
+        // 确保文件名安全
+        fileName = fileName.replace(/[\/\\]/g, '_');
+        
         const filePath = path.join(publicDir, fileName);
         fs.writeFileSync(filePath, outputBuffer);
 
@@ -186,77 +299,8 @@ export const downloadAndSaveFile = async (fileUrl, originalFileName) => {
         }
 
         const contentType = (response.headers['content-type'] || '').toLowerCase();
-        const contentDisposition = response.headers['content-disposition'] || '';
-        const xCosMetaAttr = response.headers['x-cos-meta-attr'] || '';
-        
-        log('debug', 'File download headers', { contentType, contentDisposition, xCosMetaAttr });
-
-        let fileName;
-        
-        // 优先尝试从 x-cos-meta-attr 中解析文件名（腾讯云 COS 特有，包含原始文件名）
-        if (xCosMetaAttr) {
-            try {
-                const decodedBuffer = Buffer.from(xCosMetaAttr, 'base64');
-                
-                // 简单的 Protobuf 字段 1 (index 1, wire type 2 -> 0x0A) 解析
-                let offset = 0;
-                while (offset < decodedBuffer.length) {
-                    const tag = decodedBuffer[offset];
-                    const fieldNumber = tag >> 3;
-                    const wireType = tag & 0x07;
-                    offset++;
-                    
-                    if (wireType === 2) { // Length-delimited (String, Bytes, etc.)
-                          // 读取长度（varint，这里简化假设单字节长度，通常文件名不会太长）
-                          const length = decodedBuffer[offset];
-                          offset++;
-                          
-                          if (fieldNumber === 1) { // 假设 Field 1 是文件名
-                              if (offset + length <= decodedBuffer.length) {
-                                  fileName = decodedBuffer.slice(offset, offset + length).toString('utf8');
-                              }
-                              break; 
-                          } else {
-                              offset += length;
-                          }
-                     } else {
-                        break; 
-                    }
-                }
-                
-                // 如果 protobuf 解析失败，尝试正则匹配作为回退
-                if (!fileName) {
-                     const rawStr = decodedBuffer.toString('utf8');
-                     const match = rawStr.match(/[\u4e00-\u9fa5a-zA-Z0-9_\-\s]+\.[a-zA-Z0-9]+/);
-                     if (match) {
-                         fileName = match[0];
-                     }
-                }
-
-            } catch (e) {
-                log('warn', 'Failed to parse x-cos-meta-attr', { error: e.message });
-            }
-        }
-        
-        // 其次尝试从 Content-Disposition 中提取文件名 (标准 HTTP 头)
-        if (!fileName && contentDisposition) {
-            // 尝试匹配 filename*=utf-8''xxxx (RFC 5987)
-            const matchUtf8 = contentDisposition.match(/filename\*=utf-8''([^;]+)/i);
-            if (matchUtf8 && matchUtf8[1]) {
-                fileName = decodeURIComponent(matchUtf8[1]);
-            } else {
-                // 尝试匹配 filename="xxx"
-                const match = contentDisposition.match(/filename=["']?([^"';]+)["']?/i);
-                if (match && match[1]) {
-                    // 有些时候文件名可能是 URL 编码的
-                    try {
-                        fileName = decodeURIComponent(match[1]);
-                    } catch (e) {
-                        fileName = match[1];
-                    }
-                }
-            }
-        }
+        const extractedName = extractFilenameFromHeaders(response.headers);
+        let fileName = extractedName;
 
         if (originalFileName && !fileName) {
             fileName = originalFileName;

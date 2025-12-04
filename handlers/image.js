@@ -14,7 +14,7 @@ export const prepareImageAttachment = async (ctx, imageUrl) => {
     const fileName = localImagePath.split('/').pop();
     const host = (serverHost && !serverHost.includes('127.0.0.1') && !serverHost.includes('localhost'))
       ? serverHost
-      : 'https://npzfibxxgmmk.sealoshzh.site';
+      : (process.env.SERVER_HOST || 'http://localhost:3002');
     const publicImageUrl = `${host}/public/images/${fileName}`;
     
     // 校验本地文件是否是图片且可读
@@ -49,7 +49,7 @@ export const processImmediateAIStreamWithImage = async (ctx, content, imageUrl, 
     const { publicImageUrl } = imageInfo;
     
     // 构建带图片的请求数据
-    const requestData = ctx.buildFastGPTRequestData(chatId, content || '图片内容分析', true, [
+    const requestData = ctx.buildFastGPTRequestData(chatId, content || '', true, [
         {
             type: 'image',
             url: publicImageUrl
@@ -115,7 +115,7 @@ export const processImmediateAIStreamWithImage = async (ctx, content, imageUrl, 
 export const handleImageMessage = async (ctx, messageData) => {
   const { image, msgid } = messageData;
   const imageUrl = image.url;
-  const content = '请分析这张图片'; // 默认文本提示
+  const content = ''; // 用户没有提供文字，这里为空
   
   const streamId = `stream_${msgid}_${Date.now()}`;
   ctx.streamStore.set(streamId, {

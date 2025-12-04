@@ -31,7 +31,7 @@ export const prepareFileAttachment = async (ctx, messageData) => {
         const fileName = path.basename(localFilePath);
         const host = (serverHost && !serverHost.includes('127.0.0.1') && !serverHost.includes('localhost'))
             ? serverHost
-            : 'https://npzfibxxgmmk.sealoshzh.site';
+            : (process.env.SERVER_HOST || 'http://localhost:3002');
         const publicFileUrl = `${host}/public/files/${fileName}`;
         
         return {

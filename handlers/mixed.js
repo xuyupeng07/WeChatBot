@@ -4,37 +4,44 @@ import { processImmediateAIStreamWithImage } from './image.js';
 export const handleMixedMessage = async (ctx, messageData) => {
   const { mixed, msgid } = messageData;
   let textContent = '';
-  let imageUrl = null;
+  const images = [];
 
   mixed.msg_item.forEach((item) => {
     if (item.msgtype === 'text') {
       textContent += item.text.content + ' ';
     } else if (item.msgtype === 'image') {
-      // 优先取第一个图片
-      if (!imageUrl) {
-        imageUrl = item.image.url;
-      }
+      images.push(item.image.url);
     }
   });
 
-  const finalContent = textContent.trim() || '图文消息分析';
+  const finalContent = textContent.trim(); // No default text
 
   // 如果有图片，使用图片处理流程
-  if (imageUrl) {
+  if (images.length > 0) {
     const streamId = `stream_${msgid}_${Date.now()}`;
     ctx.streamStore.set(streamId, {
       step: 0,
       content: '',
       startTime: Date.now(),
-      originalContent: finalContent,
+      originalContent: finalContent || '', // No default text
       messageData,
       aiCalling: true,
       streamContent: '',
       lastUpdateTime: Date.now()
     });
 
-    // 调用带图片的流式处理
-    processImmediateAIStreamWithImage(ctx, finalContent, imageUrl, streamId);
+    // Prepare attachments format that processAttachmentsAndCallAI expects
+    // However, processAttachmentsAndCallAI is in MessageHandler and takes attachments array with { type, data: { url } }
+    // But here we are in mixed handler.
+    // We should reuse the logic in MessageHandler or call a specialized function.
+    // The previous code called processImmediateAIStreamWithImage which only handled ONE image.
+    
+    // We need to construct attachments array
+    const attachments = images.map(url => ({ type: 'image', data: { url } }));
+    
+    // Call the main handler's method to process attachments
+    // Note: We need to make sure we have access to it. 'ctx' is MessageHandler instance.
+    ctx.processAttachmentsAndCallAI(messageData, finalContent, attachments, streamId);
     
     // 返回流式响应占位
     return ctx.createStreamResponse('', false, [], streamId);

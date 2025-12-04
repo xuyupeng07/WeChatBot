@@ -1,9 +1,26 @@
 import dotenv from 'dotenv';
-dotenv.config();
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// 强制覆盖加载 .env 文件
+const envFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development';
+// 尝试加载特定环境配置，如果不存在则回退到 .env
+if (fs.existsSync(path.join(__dirname, envFile))) {
+  dotenv.config({ path: path.join(__dirname, envFile), override: true });
+  console.log(`Debug: Loaded environment config from ${envFile}`);
+} else {
+  dotenv.config({ path: path.join(__dirname, '.env'), override: true });
+  console.log('Debug: Loaded environment config from .env');
+}
+console.log('Debug: Loaded SERVER_HOST:', process.env.SERVER_HOST);
 
 // 修正无效的 SERVER_HOST，确保使用公网域名
-if (process.env.SERVER_HOST === '127.0.0.1' || process.env.SERVER_HOST === 'localhost') {
-  process.env.SERVER_HOST = 'https://npzfibxxgmmk.sealoshzh.site';
+if (!process.env.SERVER_HOST || process.env.SERVER_HOST === '127.0.0.1' || process.env.SERVER_HOST === 'localhost') {
+  console.warn('Warning: SERVER_HOST is set to localhost/127.0.0.1. This may cause issues with external callbacks.');
 }
 import express from 'express';
 import bodyParser from 'body-parser';
@@ -101,7 +118,6 @@ const wechatCrypto = new WechatCrypto(
 );
 
 // 静态文件服务 - 用于提供下载的图片
-import path from 'path';
 app.use('/public', express.static(path.join(process.cwd(), 'public')));
 
 // 简单直传接口：如果 COS 链接不可直接下载，可由前端直接上传图片到本服务器，再生成公网 URL 给 FastGPT
@@ -269,11 +285,6 @@ app.use((req, res) => {
 });
 
 import { cleanupOldFiles } from './utils/cleanup.js';
-import { fileURLToPath } from 'url';
-
-// 获取当前文件的目录
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // 定义要清理的目录和时间
 const FILES_DIR = path.join(__dirname, 'public/files');
@@ -296,9 +307,9 @@ function startServer() {
   const server = app.listen(port, '0.0.0.0', () => {
     console.log(`企业微信智能机器人服务器启动成功 (进程 ${process.pid})`);
     console.log(`端口: ${port}`);
-    console.log(`回调地址: http://localhost:${port}/wechat/callback`);
-    console.log(`健康检查: http://localhost:${port}/health`);
-    console.log(`测试接口: http://localhost:${port}/test/webhook`);
+    console.log(`回调地址: ${process.env.SERVER_HOST || `http://localhost:${port}`}/wechat/callback`);
+    console.log(`健康检查: ${process.env.SERVER_HOST || `http://localhost:${port}`}/health`);
+    console.log(`测试接口: ${process.env.SERVER_HOST || `http://localhost:${port}`}/test/webhook`);
   });
 
   // 设置服务器超时
