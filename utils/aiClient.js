@@ -35,6 +35,8 @@ export const buildFastGPTRequestData = (chatId, content, stream, attachments = [
     });
   }
 
+
+
   const messages = [
     {
       role: 'user',

@@ -172,6 +172,11 @@ export const handleTextMessage = async (ctx, messageData) => {
           }
       }
   }
+  
+  // 如果没有任何文本内容且没有附件，默认填充"你好"
+  if (!content && attachments.length === 0) {
+      content = "你好";
+  }
 
   // 检查特殊命令 - 投票卡片测试 (企业级示例)
   if (content === '测试投票') {
