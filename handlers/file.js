@@ -10,15 +10,15 @@ export const prepareFileAttachment = async (ctx, messageData) => {
     let localFilePath = null;
     try {
         const { file } = messageData;
-    ctx.log('debug', 'File message data received', { 
-        filename: file.filename, 
-        fileext: file.fileext,
-        filesize: file.filesize
-    });
-    const fileUrl = file.url;
+        ctx.log('debug', 'File message data received', { 
+            filename: file.filename || 'unknown', 
+            fileext: file.fileext || 'unknown',
+            filesize: file.filesize || 0
+        });
+        const fileUrl = file.url;
         
         // 下载并解密文件
-        localFilePath = await downloadAndSaveFile(fileUrl, file.filename);
+        localFilePath = await downloadAndSaveFile(fileUrl, file.filename || undefined);
         
         // 验证文件
         const stat = fs.statSync(localFilePath);

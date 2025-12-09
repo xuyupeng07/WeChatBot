@@ -244,6 +244,9 @@ export const downloadAndSaveImage = async (imageUrl) => {
  */
 export const downloadAndSaveFile = async (fileUrl, originalFileName) => {
     try {
+        // 记录函数调用参数
+        log('debug', 'downloadAndSaveFile called', { fileUrl, originalFileName });
+        
         const publicDir = path.join(process.cwd(), 'public', 'files');
         if (!fs.existsSync(publicDir)) {
             fs.mkdirSync(publicDir, { recursive: true });
